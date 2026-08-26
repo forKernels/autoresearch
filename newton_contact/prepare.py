@@ -221,7 +221,13 @@ def build_and_bake(settings):
 
         s0, s1 = model.state(), model.state()
         control = model.control()
-        pipeline = newton.CollisionPipeline(model)
+        # sim.make_pipeline, NOT newton.CollisionPipeline directly. The
+        # add-on sizes the rigid contact buffer to max(16384, bodies * 512);
+        # newton's own default is 11000, and constructing the pipeline raw
+        # silently gives this harness a smaller buffer than a real bake has.
+        # That mistake produced a "contact buffer overflows at 200 bricks"
+        # finding here that was the harness's and not the product's.
+        pipeline = sim.make_pipeline(newton, model)
         contacts = pipeline.contacts()
         newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
 

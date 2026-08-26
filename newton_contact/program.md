@@ -83,9 +83,18 @@ obvious first two experiments to run properly.
   target, it is the known answer. The open question is why MESH fails.
 - **Cost is badly super-linear in body count**: 1072 ms/frame at 48 bricks,
   2864 at 100, 14505 at 200. 4.2x the bodies for 13.5x the time.
-- **The contact buffer overflows silently at 200 bricks** — "Contact buffer
-  overflowed 17580 > 11000" — so contacts are being dropped. Suspect this
-  before believing any large-pile result.
+- **The contact buffer does NOT overflow — that was this harness's own bug,
+  and it is recorded because it is the exact mistake to avoid repeating.**
+  An early version constructed `newton.CollisionPipeline(model)` directly and
+  saw "Contact buffer overflowed 17580 > 11000" at 200 bricks, which looked
+  like a product defect. It is not. newton-lab sizes the rigid contact buffer
+  itself, `max(16384, bodies * 512)` in `sim.make_pipeline`, and 11000 is
+  newton's own default. Re-run through `make_pipeline`: zero overflow warnings
+  at 200 bricks.
+
+  The lesson generalises to any harness built against this stack: **construct
+  the world the way the PRODUCT constructs it.** A harness that reaches past
+  the add-on's own setup measures something the buyer never runs.
 - **`iterations` is the contact knob; `rigid_contact_k_start` is not.** The
   latter was tried in newton-lab and changed nothing.
 - **Substeps do not fix non-finite under impact.** newton-lab measured a
