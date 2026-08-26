@@ -111,11 +111,18 @@ def run_once():
 
 
 def baseline_from_results():
-    """The first recorded row is the baseline, as in upstream's protocol."""
+    """The MOST RECENT baseline row, not the first.
+
+    A baseline is only valid for the task it was measured on. Changing the
+    reference clip changes the task, so it has to be re-established - and if
+    this returned the first row instead, a candidate would be silently compared
+    against a baseline measured on a different clip, which is precisely the
+    confound the two-run guard exists to prevent.
+    """
     if not RESULTS.exists():
         return None, None
     rows = [r.split("\t") for r in RESULTS.read_text().splitlines()[1:] if r.strip()]
-    for r in rows:
+    for r in reversed(rows):
         if len(r) > 6 and r[6] == "BASELINE":
             return float(r[2]), float(r[3])
     return None, None
