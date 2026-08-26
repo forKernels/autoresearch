@@ -21,3 +21,6 @@ dev/
 
 # Results file
 results.tsv
+
+# newton_policy: per-experiment checkpoints and tensorboard events
+newton_policy/run/

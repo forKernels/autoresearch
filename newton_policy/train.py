@@ -1,0 +1,123 @@
+"""The file the agent edits. Everything here is fair game.
+
+One experiment: build a G1 tracking environment, train for the fixed budget in
+`prepare.py`, then hand the checkpoint to `prepare.evaluate_completion`, which
+scores it in an environment this file does not control.
+
+    uv run newton_policy/train.py        (or plain python3 with PYTHONPATH set)
+
+What is worth changing, roughly in order of what has NOT been tried:
+
+  * `k_ee` - the end-effector term. Off here. The reward currently scores joint
+    ANGLES, and a policy was measured tracking them to 0.033 rad while falling
+    over: angles compound down a limb, so two degrees at hip and knee is
+    centimetres at the foot. Needs a reference carrying body positions.
+  * `lookahead_seconds` - 0/20/40/80 ms, inherited from a 0.265 m robot and
+    never questioned for a 0.76 m one. A humanoid may need to see a fall
+    further ahead than 80 ms.
+  * PPO hyperparameters and the network. Untouched so far.
+  * `alive_bonus`, `action_penalty`, `action_scale` - all tried at 150 and
+    1500 iterations against a broken metric, so those results say nothing and
+    are worth redoing honestly.
+
+What has already been measured, so re-running it wastes a slot:
+
+  * Lowering PADMM iterations is NOT a speedup. It returns an unconverged
+    solution and throws the robot through the floor at foot strike. Do not.
+  * `collect_solver_info` costs 10x, silently.
+  * 34M -> 98M steps changed nothing once the policy was already completing.
+"""
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prepare  # noqa: E402  - read-only, owns the metric
+
+
+# --- the experiment ---------------------------------------------------------
+
+ENV_KWARGS = dict(
+    alive_bonus=0.0,
+    action_penalty=0.0,
+    # action_scale=0.5,             # the robot's own default if omitted
+    # k_ee is not plumbed to the env yet - the reference has no body positions
+)
+
+LOOKAHEAD_SECONDS = (0.0, 0.02, 0.04, 0.08)
+
+PPO = dict(
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    clip_param=0.2,
+    gamma=0.99,
+    lam=0.95,
+    value_loss_coef=1.0,
+    entropy_coef=0.005,
+    learning_rate=1.0e-3,
+    max_grad_norm=1.0,
+    schedule="adaptive",
+    desired_kl=0.01,
+)
+
+HIDDEN_DIMS = [512, 256, 128]
+INIT_STD = 0.3
+NUM_STEPS_PER_ENV = 24
+
+
+def build_train_cfg():
+    net = {"class_name": "MLPModel", "hidden_dims": HIDDEN_DIMS,
+           "activation": "elu", "obs_normalization": True}
+    actor = dict(net)
+    actor["distribution_cfg"] = {"class_name": "GaussianDistribution",
+                                 "init_std": INIT_STD, "std_type": "scalar",
+                                 "learn_std": True}
+    return {
+        "algorithm": {"class_name": "PPO", **PPO},
+        "actor": actor,
+        "critic": dict(net),
+        "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
+        "num_steps_per_env": NUM_STEPS_PER_ENV,
+        "save_interval": 10_000,
+        "empirical_normalization": False,
+    }
+
+
+def main():
+    from rsl_rl.runners import OnPolicyRunner
+
+    m = prepare._rl()
+    t0 = time.time()
+
+    env = m["mujoco_env"].G1Env(
+        reference=m["train"]._PlaceholderReference(),
+        num_envs=prepare.TRAIN_ENVS, **ENV_KWARGS)
+    env.bind_reference(m["reference"].ReferenceMotion.from_npz(
+        prepare.REFERENCE, env.actuated_joint_names,
+        lookahead_seconds=LOOKAHEAD_SECONDS))
+
+    out = Path(__file__).resolve().parent / "run"
+    out.mkdir(exist_ok=True)
+    cfg = build_train_cfg()
+    runner = OnPolicyRunner(m["vecenv"].DrLegsVecEnv(env), cfg,
+                            log_dir=str(out), device=env.device)
+    runner.learn(num_learning_iterations=prepare.TRAIN_ITERATIONS)
+    train_s = time.time() - t0
+
+    ckpt = out / f"model_{prepare.TRAIN_ITERATIONS - 1}.pt"
+    runner.save(str(ckpt))
+    result = prepare.evaluate_completion(ckpt, build_train_cfg())
+
+    print("\n---")
+    print(f"completion_rate:  {result['completion_rate']:.4f}")
+    print(f"completed:        {result['completed']}")
+    print(f"terminated:       {result['terminated']}")
+    print(f"episodes:         {result['episodes']}")
+    print(f"training_seconds: {train_s:.1f}")
+    print(f"iterations:       {prepare.TRAIN_ITERATIONS}")
+    print(f"envs:             {prepare.TRAIN_ENVS}")
+
+
+if __name__ == "__main__":
+    main()
