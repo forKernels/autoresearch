@@ -42,7 +42,11 @@ ENV_KWARGS = dict(
     alive_bonus=0.0,
     action_penalty=0.0,
     # action_scale=0.5,             # the robot's own default if omitted
-    # k_ee is not plumbed to the env yet - the reference has no body positions
+    # Explicitly off. The reference HAS body positions, so leaving this unset
+    # would auto-scale the end-effector term on and make the baseline carry the
+    # very change it is the control for. reward.py gates on `if self.k_ee`, so
+    # 0.0 skips the term entirely rather than multiplying by exp(0)=1.
+    k_ee=0.0,
 )
 
 LOOKAHEAD_SECONDS = (0.0, 0.02, 0.04, 0.08)

@@ -22,6 +22,7 @@ what to keep is the agent's job and should stay visible.
 
 import argparse
 import collections
+import os
 import re
 import statistics
 import subprocess
@@ -35,7 +36,15 @@ import prepare  # noqa: E402  - read-only, owns the metric
 
 RESULTS = HERE / "results.tsv"
 HEADER = ("when\tnote\tcompletion_mean\tcompletion_spread\truns\t"
-          "baseline\tverdict\tdiff_lines\n")
+          "baseline\tverdict\tdiff_lines\tscores\n")
+
+#: Results measured before the paired design existed are in
+#: `results-unpaired.tsv`. They are kept rather than deleted, and they are NOT
+#: read as baselines: their bar came from the spread of two runs launched
+#: back-to-back in one process, which measured within-invocation noise and was
+#: then applied to a comparison spanning an hour. Same-config across-invocation
+#: sigma measured 0.082 against a within-invocation 0.044, so every verdict in
+#: that file understates its own error bar by roughly two.
 
 
 #: Always shown: anything that means the run is in trouble, and the final
@@ -61,8 +70,12 @@ _METRIC = re.compile(r"Mean episode (completion_rate|terminated|length):")
 _EVERY = 25
 
 
-def run_once():
-    """One training run, streamed.
+def run_once(index):
+    """One training run at repeat `index`, streamed.
+
+    `index` reaches `prepare._seed_training` through the environment rather
+    than an argument, because the seeding happens at prepare's IMPORT and
+    train.py is the file the agent edits - see prepare.TRAIN_SEEDS.
 
     Streams rather than capturing, because a driver meant to run unattended
     should not be a black box for six minutes at a time - a hung or thrashing
@@ -73,6 +86,7 @@ def run_once():
         [sys.executable, "-u", str(HERE / "train.py")],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
+        env={**os.environ, "NEWTON_POLICY_RUN": str(index)},
     )
     score = None
     tail = collections.deque(maxlen=40)
@@ -111,7 +125,13 @@ def run_once():
 
 
 def baseline_from_results():
-    """The MOST RECENT baseline row, not the first.
+    """Per-seed scores of the MOST RECENT baseline row, not the first.
+
+    Returns the individual run scores rather than a mean, because the
+    comparison is PAIRED: candidate run k is compared against baseline run k,
+    which shared its seed and therefore its initialisation. Comparing the means
+    instead would leave the seed-to-seed spread in both arms, and that spread
+    is the term this design exists to cancel.
 
     A baseline is only valid for the task it was measured on. Changing the
     reference clip changes the task, so it has to be re-established - and if
@@ -120,12 +140,12 @@ def baseline_from_results():
     confound the two-run guard exists to prevent.
     """
     if not RESULTS.exists():
-        return None, None
+        return None
     rows = [r.split("\t") for r in RESULTS.read_text().splitlines()[1:] if r.strip()]
     for r in reversed(rows):
-        if len(r) > 6 and r[6] == "BASELINE":
-            return float(r[2]), float(r[3])
-    return None, None
+        if len(r) > 8 and r[6] == "BASELINE" and r[8].strip():
+            return [float(x) for x in r[8].split(",")]
+    return None
 
 
 def diff_lines():
@@ -154,8 +174,9 @@ def main():
 
     scores = []
     for i in range(args.repeats):
-        print(f"[experiment] run {i + 1}/{args.repeats}: {args.note}")
-        s = run_once()
+        seed = prepare.TRAIN_SEEDS[i % len(prepare.TRAIN_SEEDS)]
+        print(f"[experiment] run {i + 1}/{args.repeats} (seed {seed}): {args.note}")
+        s = run_once(i)
         if s is None:
             print("[experiment] aborting - a run did not complete")
             return 1
@@ -164,35 +185,73 @@ def main():
 
     mean = statistics.fmean(scores)
     spread = (max(scores) - min(scores)) if len(scores) > 1 else 0.0
-    base, base_spread = baseline_from_results()
+    base = baseline_from_results()
 
     if args.baseline or base is None:
         verdict = "BASELINE"
         print(f"\n[experiment] BASELINE completion_rate {mean:.4f}  spread {spread:.4f}")
+        print(f"[experiment] per-seed {', '.join(f'{x:.4f}' for x in scores)}")
+    elif len(base) != len(scores):
+        # Pairing is by POSITION, and position is seed. Different lengths mean
+        # the two arms did not face the same set of initialisations, so the
+        # difference would mix a real effect with a seed swap.
+        print(f"\n[experiment] baseline has {len(base)} runs, this has "
+              f"{len(scores)} - cannot pair. Re-run the baseline at "
+              f"--repeats {args.repeats}.")
+        return 1
     else:
-        # The bar is the larger of the two spreads. A candidate has to clear
-        # the noise of BOTH the thing it is beating and itself - otherwise a
-        # noisy candidate wins by being noisy.
-        bar = max(spread, base_spread or 0.0)
-        delta = mean - base
-        if delta > bar:
+        # PAIRED: candidate run k against baseline run k, same seed, so the
+        # initialisation cancels instead of contributing to both arms.
+        d = [c - b for c, b in zip(scores, base)]
+        mean_d = statistics.fmean(d)
+        paired_spread = (max(d) - min(d)) if len(d) > 1 else 0.0
+        floor = prepare.PAIRED_NOISE_FLOOR
+        bar = max(paired_spread, floor or 0.0)
+
+        print()
+        for k, (b, c, dk) in enumerate(zip(base, scores, d)):
+            seed = prepare.TRAIN_SEEDS[k % len(prepare.TRAIN_SEEDS)]
+            print(f"[experiment] seed {seed}: {b:.4f} -> {c:.4f}   {dk:+.4f}")
+        print(f"[experiment] mean paired delta {mean_d:+.4f}   bar {bar:.4f}"
+              f"   (paired spread {paired_spread:.4f}, floor "
+              f"{'unmeasured' if floor is None else f'{floor:.4f}'})")
+
+        # Direction has to agree across seeds. Two differences that clear a bar
+        # on average while pointing opposite ways is not an effect, it is two
+        # draws from a wide distribution that happened to average well.
+        agree = all(x > 0 for x in d) or all(x < 0 for x in d)
+        if not agree:
+            verdict = "NEUTRAL"
+            print("[experiment] seeds disagree on the SIGN - not an effect.")
+        elif mean_d > bar:
             verdict = "KEEP"
-        elif delta < -bar:
+        elif mean_d < -bar:
             verdict = "DISCARD"
         else:
             verdict = "NEUTRAL"
-        print(f"\n[experiment] {mean:.4f} vs baseline {base:.4f}   "
-              f"delta {delta:+.4f}   noise bar {bar:.4f}")
+
+        # A bar built only from two paired differences can be arbitrarily small
+        # by luck, which is the same failure that made the unpaired results
+        # unreadable. Until the null experiment measures how far apart two runs
+        # of the SAME config on the SAME seed land, no verdict is trustworthy.
+        if floor is None and verdict in ("KEEP", "DISCARD"):
+            print(f"[experiment] would call {verdict}, but PAIRED_NOISE_FLOOR "
+                  f"is unmeasured, so the bar has no floor and this may be "
+                  f"luck. Run the baseline AGAIN as a candidate (a null "
+                  f"experiment) and set prepare.PAIRED_NOISE_FLOOR from it.")
+            verdict = "UNCALIBRATED"
+
         print(f"[experiment] VERDICT: {verdict}")
         if verdict == "NEUTRAL":
             print("[experiment] inside the noise - this is not a result. "
                   "Record it and move on rather than re-running until it wins.")
 
+    base_mean = "" if base is None else f"{statistics.fmean(base):.4f}"
     with RESULTS.open("a") as f:
         f.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\t"
                 f"{args.note}\t{mean:.4f}\t{spread:.4f}\t{args.repeats}\t"
-                f"{'' if base is None else f'{base:.4f}'}\t{verdict}\t"
-                f"{diff_lines()}\n")
+                f"{base_mean}\t{verdict}\t{diff_lines()}\t"
+                f"{','.join(f'{x:.4f}' for x in scores)}\n")
     print(f"[experiment] recorded in {RESULTS.name}")
     return 0
 

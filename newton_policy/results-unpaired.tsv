@@ -1,0 +1,7 @@
+when	note	completion_mean	completion_spread	runs	baseline	verdict	diff_lines
+2026-08-26T07:47:00+00:00	unmodified baseline	0.4911	0.0567	2		BASELINE	0
+2026-08-26T08:00:55+00:00	lookahead 0/100/300/600ms (was 0/20/40/80)	0.3316	0.0051	2	0.4911	DISCARD	7
+2026-08-26T08:19:25+00:00	lookahead 0/10/20/40ms (denser near-term)	0.3614	0.0350	2	0.4911	DISCARD	9
+2026-08-26T08:38:32+00:00	smoothness_penalty 1.0 (action rate)	0.4187	0.0912	2	0.4911	NEUTRAL	5
+2026-08-26T08:51:04+00:00	re-baseline on ee5 reference, k_ee off	0.3553	0.0145	2	0.4911	BASELINE	5
+2026-08-26T09:02:55+00:00	k_ee on, 4 end effectors (ankles + elbows)	0.3973	0.0974	2	0.3553	NEUTRAL	5
