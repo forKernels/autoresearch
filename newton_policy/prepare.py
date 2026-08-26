@@ -75,7 +75,8 @@ TRAIN_SEEDS = (20260826, 19720305)
 #: Unset until that null experiment has been run - `experiment.py` refuses to
 #: call a KEEP without it, because a bar derived only from two paired
 #: differences can be arbitrarily small by luck.
-#: MUST be re-measured whenever the metric changes, and is None until it is.
+#: MUST be re-measured whenever the metric changes, and stays None until it is
+#: - `experiment.py` refuses to return a verdict without it.
 #:
 #: It was 0.1329, measured by a null experiment on `completion_rate`. Tracking
 #: errors run 0.02-0.07, so carrying that number across the metric change would
@@ -84,7 +85,12 @@ TRAIN_SEEDS = (20260826, 19720305)
 #: rather than the candidates was the reason. A noise floor belongs to the
 #: metric it was measured on, exactly as a baseline belongs to the task it was
 #: measured on.
-PAIRED_NOISE_FLOOR = None
+#:
+#: Measured by the null experiment on THIS metric (tracking_error at
+#: TRAIN_ITERATIONS=1000): the baseline re-run against itself, same seeds,
+#: nothing changed. Paired differences were -0.00674, -0.00950.
+#: A paired delta smaller than this is something the identical config makes.
+PAIRED_NOISE_FLOOR = 0.00950
 
 
 def _seed_training():
@@ -148,7 +154,7 @@ def _rl():
     return mods
 
 
-def evaluate_tracking(checkpoint, train_cfg):
+def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     """THE METRIC. Roll a checkpoint out and measure how well it TRACKS.
 
     Returns `tracking_error`, the mean absolute joint deviation from the
@@ -167,6 +173,33 @@ def evaluate_tracking(checkpoint, train_cfg):
     `completion_rate` by saturation. Tracking error is bounded by neither: a
     policy that finishes every episode can still track better or worse, which
     is the property the other two lacked.
+
+    `lookahead_seconds` is REQUIRED, and that is the whole point of it.
+
+    Everything else about the evaluation world is fixed here so a candidate
+    cannot score itself somewhere easier. The lookahead horizon is the one
+    thing that cannot be: it is part of the POLICY'S INPUT CONTRACT, not part
+    of the task. Evaluating a policy on a horizon it did not train on is not
+    stricter, it is incoherent - the observation vector means something
+    different.
+
+    It used to default. `train.py` passed the candidate's horizon and this
+    passed nothing, so any candidate that changed the horizon to a different
+    tuple of the SAME LENGTH trained on one and was scored on another. Same
+    length means same observation width, so nothing raised: `runner.load`
+    succeeded and the policy was fed a silently wrong vector. Both lookahead
+    experiments run under that bug came back markedly worse, which is exactly
+    what an observation mismatch produces, and both were recorded as results.
+
+    Required rather than defaulted because a default is what caused it. A
+    caller that has not thought about the horizon should not be able to
+    evaluate at all.
+
+    (The same trap, found the same week in `newton_contact`: it built its
+    collision pipeline directly instead of through `sim.make_pipeline`, gave
+    itself a contact buffer smaller than any real bake gets, and killed four
+    confident findings when it was fixed. Construct the world the way the thing
+    being measured constructs it.)
 
     Two things that keep it honest:
 
@@ -193,7 +226,8 @@ def evaluate_tracking(checkpoint, train_cfg):
     env = m["mujoco_env"].G1Env(
         reference=m["train"]._PlaceholderReference(), num_envs=EVAL_ENVS)
     env.bind_reference(m["reference"].ReferenceMotion.from_npz(
-        REFERENCE, env.actuated_joint_names))
+        REFERENCE, env.actuated_joint_names,
+        lookahead_seconds=lookahead_seconds))
 
     vec = m["vecenv"].DrLegsVecEnv(env)
     runner = OnPolicyRunner(vec, train_cfg, log_dir=None, device=env.device)
@@ -252,6 +286,9 @@ def evaluate_tracking(checkpoint, train_cfg):
         "terminated": fell,
         "episodes": ended,
         "live_steps": live_steps,
+        # Recorded so a mismatch is visible in the run's own output rather than
+        # having to be inferred from a result that looks merely disappointing.
+        "lookahead_seconds": list(lookahead_seconds),
     }
 
 
@@ -261,6 +298,6 @@ def evaluate_tracking(checkpoint, train_cfg):
 COMPARABLE_COMPLETION = 0.99
 
 
-def evaluate_completion(checkpoint, train_cfg):
+def evaluate_completion(checkpoint, train_cfg, lookahead_seconds):
     """Deprecated alias. `completion_rate` saturates; see evaluate_tracking."""
-    return evaluate_tracking(checkpoint, train_cfg)
+    return evaluate_tracking(checkpoint, train_cfg, lookahead_seconds)

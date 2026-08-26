@@ -111,7 +111,10 @@ def main():
 
     ckpt = out / f"model_{prepare.TRAIN_ITERATIONS - 1}.pt"
     runner.save(str(ckpt))
-    result = prepare.evaluate_tracking(ckpt, build_train_cfg())
+    # The horizon MUST be the one this run trained on - see
+    # prepare.evaluate_tracking. Passing it is not optional.
+    result = prepare.evaluate_tracking(ckpt, build_train_cfg(),
+                                       LOOKAHEAD_SECONDS)
 
     print("\n---")
     # tracking_error is THE metric and LOWER IS BETTER. The other two are
@@ -123,6 +126,7 @@ def main():
     print(f"root_error_m:     {result['root_error_m']:.5f}")
     print(f"ee_error_m:       {result['ee_error_m'] if result['ee_error_m'] is None else round(result['ee_error_m'], 5)}")
     print(f"comparable:       {result['comparable']}")
+    print(f"lookahead:        {result['lookahead_seconds']}")
     print(f"completion_rate:  {result['completion_rate']:.4f}")
     print(f"completed:        {result['completed']}")
     print(f"terminated:       {result['terminated']}")
