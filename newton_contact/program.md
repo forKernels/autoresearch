@@ -46,64 +46,80 @@ lost — which is not a finding, it is buying retention with time nobody has.
 
 ```
 mesh floor, BOX bricks, 16 substeps, 20 iterations, MuJoCo
-    run 1  retention 0.6667      run 2  retention 0.3333
-    mean   0.5000               spread 0.3333
+    4 runs   retention 1.0000   spread 0.0000   ~14.3 s each
 ```
 
-**Read that spread before you read anything else.** Two identical runs differ
-by a third of the pile. The metric is quantised in units of ONE LAYER - 16
-bricks - because the pile fails by losing whole layers, so 48/48, 32/48, 16/48
-and 0/48 are the only values it can take.
+**This baseline has NO HEADROOM, and that is the honest state of this harness
+right now.** It holds 48/48 every time. A loop pointed at it cannot improve
+anything and would spend the night recording NEUTRAL.
 
-That means only LARGE effects are detectable here. A candidate must clear the
-baseline by more than one whole layer to count. A one-layer "improvement" seen
-once is noise, and `experiment.py` will correctly call it NEUTRAL. Do not
-re-run a candidate until it wins.
+## What this harness got wrong about itself, twice
 
-This is the harness's own first finding, and it is a limitation rather than a
-result. Widening the pile would subdivide the step and costs time
-super-linearly. That trade is open and unmade.
+Both are recorded because both are the mistake to avoid repeating, and the
+second one invalidated everything the first one appeared to find.
 
-## What is already known — do NOT spend slots rediscovering this
+**1. It built its own collision pipeline.** Early versions called
+`newton.CollisionPipeline(model)` directly. newton-lab does not: it sizes the
+rigid contact buffer to `max(16384, bodies * 512)` in `sim.make_pipeline`,
+while newton's raw default is 11000. So this harness ran with a smaller contact
+buffer than any real bake, and an overflowed buffer does not raise - it warns
+and DROPS contacts.
 
-All measured, on this harness or in newton-lab. **The first two were SINGLE
-runs, taken before the noise floor was known, and one whole layer is inside the
-noise - so treat them as leads to confirm, not as results.** They are the
-obvious first two experiments to run properly.
+**2. Everything it then "found" was that bug.** With the correct buffer, the
+whole picture changes:
 
-- **More substeps may not be better here, and single runs suggested it is
-  worse.** 4 substeps held 48/48 once; 8 and 16 each lost 16/48 once. One run
-  each, and the spread is exactly one layer, so this is a LEAD. If it survives
-  four repeats it is a real and counter-intuitive finding; if it does not, it
-  was the metric all along.
-- **HULL may beat analytic BOX on a mesh floor.** 48/48 against 32/48, one run
-  each, at 52 s against 32 s. Same caveat, same status: confirm it.
-- **A PLANE floor holds everything** — 48/48, and 0/200 in newton-lab's own
-  200-brick measurement where a mesh floor lost 23. PLANE is not a research
-  target, it is the known answer. The open question is why MESH fails.
-- **Cost is badly super-linear in body count**: 1072 ms/frame at 48 bricks,
-  2864 at 100, 14505 at 200. 4.2x the bodies for 13.5x the time.
-- **The contact buffer does NOT overflow — that was this harness's own bug,
-  and it is recorded because it is the exact mistake to avoid repeating.**
-  An early version constructed `newton.CollisionPipeline(model)` directly and
-  saw "Contact buffer overflowed 17580 > 11000" at 200 bricks, which looked
-  like a product defect. It is not. newton-lab sizes the rigid contact buffer
-  itself, `max(16384, bodies * 512)` in `sim.make_pipeline`, and 11000 is
-  newton's own default. Re-run through `make_pipeline`: zero overflow warnings
-  at 200 bricks.
+| | undersized buffer | correct buffer |
+|---|---|---|
+| retention | 0.5000 | **1.0000** |
+| spread over runs | 0.3333 | **0.0000** |
+| wall clock | 32.4 s | **14.3 s** |
 
-  The lesson generalises to any harness built against this stack: **construct
-  the world the way the PRODUCT constructs it.** A harness that reaches past
-  the add-on's own setup measures something the buyer never runs.
-- **`iterations` is the contact knob; `rigid_contact_k_start` is not.** The
-  latter was tried in newton-lab and changed nothing.
-- **Substeps do not fix non-finite under impact.** newton-lab measured a
-  156-brick wall diverging at every substep count tried; real-world masses
-  fixed it at every mass ratio tried. If doubling substeps twice has not
-  helped, the scene is the cause.
-- **The mesh-contact size floor is ~17 mm under MuJoCo and ~40 mm under VBD.**
-  The bricks here are 45 mm, deliberately clear of it, so this scene is
-  measuring STACKING and not the size floor.
+So all of these are DEAD and must not be carried forward:
+
+- ~~"more substeps is worse - 4 holds 48/48, 8 and 16 lose 16/48"~~ - dropped
+  contacts, not solver behaviour.
+- ~~"HULL beats analytic BOX on a mesh floor"~~ - same cause.
+- ~~"the metric is hopelessly noisy, spread 0.3333"~~ - the run-to-run spread
+  is ZERO on this scene. MuJoCo is far more reproducible here than the policy
+  harness's Kamino rollouts, and the noise was the buffer overflowing a
+  different number of times per run.
+- ~~"the contact buffer overflows at 200 bricks"~~ - it does not, through
+  `make_pipeline`.
+
+**The one lesson that survives, and it is worth more than the findings it
+destroyed: construct the world the way the PRODUCT constructs it.** A harness
+that reaches past the add-on's own setup is not measuring the add-on, and it
+will produce confident, reproducible, entirely fictional results.
+
+## What this harness needs next
+
+A scene with real headroom, since the current one is solved. Unmade choices,
+roughly in order of promise:
+
+- **More bricks.** 200 still finishes; cost is super-linear (1072 ms/frame at
+  48, 2864 at 100, 14505 at 200 - measured with the undersized buffer, so
+  re-measure) but the budget cap is the constraint to respect.
+- **Impact rather than settling.** newton-lab's own hard case is a wrecking
+  ball into a wall, which diverges at every substep count when the bricks are
+  sub-kilogram. That has known headroom.
+- **Bricks near the mesh-contact size floor** (~17 mm MuJoCo, ~40 mm VBD), so
+  the scene sits where the product is known to fail.
+
+Do NOT simply shrink the pile until it fails - `prepare.py` owns the scene
+precisely so the metric cannot be gamed by choosing an easier or harder world
+to suit the result.
+
+## What is still known, and still stands
+
+From newton-lab, independent of this harness:
+
+- **`iterations` is the contact knob; `rigid_contact_k_start` is not.**
+- **Substeps do not fix non-finite under impact.** A 156-brick wall diverged at
+  every substep count tried; real-world masses fixed it at every mass ratio.
+- **The mesh-contact size floor is ~17 mm under MuJoCo, ~40 mm under VBD.**
+- **A PLANE floor holds a pile where a mesh floor historically did not** -
+  0/200 against 23/200. Worth re-checking now that the buffer question is
+  settled, because that measurement predates it.
 
 ## Fenced off — these are contracts, not knobs
 
