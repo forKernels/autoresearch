@@ -21,6 +21,7 @@ what to keep is the agent's job and should stay visible.
 """
 
 import argparse
+import collections
 import re
 import statistics
 import subprocess
@@ -37,21 +38,76 @@ HEADER = ("when\tnote\tcompletion_mean\tcompletion_spread\truns\t"
           "baseline\tverdict\tdiff_lines\n")
 
 
+#: Always shown: anything that means the run is in trouble, and the final
+#: summary. Never throttled - a failure buried behind a throttle is worse than
+#: no streaming at all.
+#
+# Word-bounded on purpose. An unbounded `nan` matches the `.conan2` in warp's
+# USD warning paths, which turned this filter into a firehose of 200 identical
+# material-binding warnings - the same substring-against-English mistake that
+# made newton-lab's check_parked fire on the word "policy" in a docstring.
+_ALWAYS = re.compile(
+    r"Traceback|\bError\b|\berror\b|\bassert|out of memory|\bKilled\b|"
+    r"\bNaN\b|\bnan\b|"
+    r"^completion_rate:|^completed:|^terminated:|^episodes:|^training_seconds:",
+)
+#: Progress. Throttled, because 300 iterations x several lines is 1500 lines
+#: per run and a hundred experiments would bury the findings in their own logs.
+_PROGRESS = re.compile(r"Learning iteration\s+(\d+)/")
+#: Per-iteration metrics, shown only alongside a throttled progress line.
+_METRIC = re.compile(r"Mean episode (completion_rate|terminated|length):")
+
+#: Show one progress block every N iterations.
+_EVERY = 25
+
+
 def run_once():
-    """One training run. Returns the completion_rate it reports, or None."""
-    proc = subprocess.run(
+    """One training run, streamed.
+
+    Streams rather than capturing, because a driver meant to run unattended
+    should not be a black box for six minutes at a time - a hung or thrashing
+    run has to be visible while it is happening, not at the timeout. The output
+    is parsed on the way past, so nothing is lost by showing it.
+    """
+    proc = subprocess.Popen(
         [sys.executable, "-u", str(HERE / "train.py")],
-        capture_output=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
     )
+    score = None
+    tail = collections.deque(maxlen=40)
+    verbose = False
+    for raw in proc.stdout:
+        line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip()
+        tail.append(line)
+
+        m = re.match(r"completion_rate:\s*([\d.]+)", line.strip())
+        if m:
+            score = float(m.group(1))
+
+        p = _PROGRESS.search(line)
+        if p:
+            verbose = int(p.group(1)) % _EVERY == 0
+            if verbose:
+                print(f"    {line.strip()}", flush=True)
+            continue
+        if _ALWAYS.search(line):
+            print(f"    {line.strip()}", flush=True)
+        elif verbose and _METRIC.search(line):
+            print(f"    {line.strip()}", flush=True)
+    proc.wait()
+
     if proc.returncode != 0:
-        tail = "\n".join(proc.stdout.strip().splitlines()[-15:])
-        print(f"  run FAILED (exit {proc.returncode})\n{tail}\n{proc.stderr[-800:]}")
+        print(f"  run FAILED (exit {proc.returncode}). Last lines:")
+        for line in tail:
+            print(f"    {line}")
         return None
-    m = re.search(r"^completion_rate:\s*([\d.]+)", proc.stdout, re.M)
-    if not m:
+    if score is None:
         print("  run produced no completion_rate - did train.py print the summary?")
+        for line in tail:
+            print(f"    {line}")
         return None
-    return float(m.group(1))
+    return score
 
 
 def baseline_from_results():
