@@ -20,7 +20,7 @@ AGENTS.md
 dev/
 
 # Results file
-results.tsv
+results*.tsv
 
 # newton_policy: per-experiment checkpoints and tensorboard events
 newton_policy/run/

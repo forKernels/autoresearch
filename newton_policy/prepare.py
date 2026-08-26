@@ -34,7 +34,18 @@ REFERENCE = f"{NEWTON_LAB}/runs/g1_v05_ee5.npz"
 
 #: One experiment. ~5 minutes at 512 envs / ~11.2k env-steps per second, which
 #: is roughly 12 experiments per hour - the same cadence karpathy's budget gives.
-TRAIN_ITERATIONS = 300
+#: Past the cliff. Measured on runs/20260825-151727, one run, one eval seed,
+#: budget the only variable:
+#:
+#:     300 -> 0.2960     500 -> 0.9841     750 -> 1.0000
+#:    1000..7999 -> 1.0000, zero terminations, 1228 episodes every time
+#:
+#: 300 was not merely small, it sat ON the phase transition - the steepest part
+#: of the curve, where a little more training is a lot more completion. That is
+#: why two runs of an identical config scattered by 0.13 and why six
+#: experiments in a row resolved nothing. 1000 is comfortably into saturation
+#: with margin, which is also why the metric below is no longer completion.
+TRAIN_ITERATIONS = 1000
 TRAIN_ENVS = 512
 
 #: Evaluation. Deliberately different from training: more environments than a
@@ -64,6 +75,15 @@ TRAIN_SEEDS = (20260826, 19720305)
 #: Unset until that null experiment has been run - `experiment.py` refuses to
 #: call a KEEP without it, because a bar derived only from two paired
 #: differences can be arbitrarily small by luck.
+#: MUST be re-measured whenever the metric changes, and is None until it is.
+#:
+#: It was 0.1329, measured by a null experiment on `completion_rate`. Tracking
+#: errors run 0.02-0.07, so carrying that number across the metric change would
+#: have set a bar wider than the entire range of the new metric: every result
+#: NEUTRAL forever, reported with confidence, and nothing to suggest the bar
+#: rather than the candidates was the reason. A noise floor belongs to the
+#: metric it was measured on, exactly as a baseline belongs to the task it was
+#: measured on.
 PAIRED_NOISE_FLOOR = None
 
 
@@ -128,12 +148,39 @@ def _rl():
     return mods
 
 
-def evaluate_completion(checkpoint, train_cfg):
-    """THE METRIC. Roll a trained checkpoint out and count how episodes ended.
+def evaluate_tracking(checkpoint, train_cfg):
+    """THE METRIC. Roll a checkpoint out and measure how well it TRACKS.
 
-    Returns a dict with `completion_rate` - of the episodes that ended, the
-    share that reached the end of the clip rather than falling.
+    Returns `tracking_error`, the mean absolute joint deviation from the
+    reference in radians, over every step where the policy was live. LOWER IS
+    BETTER - the opposite direction from the metric this replaces.
 
+    Why it replaces `completion_rate`, which is still reported below as a
+    guard: completion saturates. Past ~750 iterations every policy finishes
+    every episode, so the number is pinned at 1.0 and cannot tell a good policy
+    from a perfect one; below ~500 it is on a cliff and measures mostly noise.
+    Its useful range is about 200 iterations wide, which is not somewhere a
+    research loop can live.
+
+    That makes this the THIRD metric on this project bounded by something other
+    than policy quality - `mean episode length` by the sampling scheme,
+    `completion_rate` by saturation. Tracking error is bounded by neither: a
+    policy that finishes every episode can still track better or worse, which
+    is the property the other two lacked.
+
+    Two things that keep it honest:
+
+    **Steps where an episode ENDED are excluded.** `vecenv.step` resets a done
+    environment and returns the post-reset observation, and reference state
+    initialisation puts that reset exactly ON the reference - error zero. Left
+    in, those steps would reward falling: fall often, reset often, average in
+    more zeros. The `live` mask removes them.
+
+    **`completion_rate` is still the guard.** Even with the mask, a policy that
+    falls constantly spends more of its time near a reset and less of it far
+    down a diverging trajectory. So a tracking error measured while the robot
+    is falling over is not comparable to one measured while it completes, and
+    `comparable` says so rather than leaving the caller to notice.
     The environment is built here, from the constants above, and NOT from
     whatever the training config used. A candidate cannot make itself look good
     by evaluating in an easier world.
@@ -156,6 +203,10 @@ def evaluate_completion(checkpoint, train_cfg):
     torch.manual_seed(EVAL_SEED)
     obs, _ = vec.reset()
     fell = finished = 0
+    joint_sum = root_sum = ee_sum = 0.0
+    live_steps = 0
+    has_ee = bool(getattr(env.reference, "has_body_positions", False))
+
     for _ in range(EVAL_STEPS):
         with torch.inference_mode():
             action = policy(obs)
@@ -166,10 +217,50 @@ def evaluate_completion(checkpoint, train_cfg):
             finished += int(t.sum())
             fell += int((~t).sum())
 
+        with torch.inference_mode():
+            live = ~dones
+            n_live = int(live.sum())
+            if n_live:
+                q = env.actuated_q()[live]
+                q_ref = env._ref(env.reference.q)[live]
+                joint_sum += float((q - q_ref).abs().mean(dim=-1).sum())
+
+                root = env.root_pose_wxyz()[live]
+                root_ref = env._ref(env.reference.root)[live]
+                root_sum += float(
+                    (root[:, :3] - root_ref[:, :3]).norm(dim=-1).sum())
+
+                if has_ee:
+                    ee = env.end_effector_positions()
+                    if ee is not None:
+                        ee_sum += float((ee[live] -
+                                         env._ref(env.reference.body)[live]
+                                         ).norm(dim=-1).mean(dim=-1).sum())
+                live_steps += n_live
+
     ended = fell + finished
+    completion = (finished / ended) if ended else 0.0
     return {
-        "completion_rate": (finished / ended) if ended else 0.0,
+        # THE metric. Radians, lower is better.
+        "tracking_error": (joint_sum / live_steps) if live_steps else float("inf"),
+        "root_error_m": (root_sum / live_steps) if live_steps else float("inf"),
+        "ee_error_m": (ee_sum / live_steps) if (has_ee and live_steps) else None,
+        # The guard, not the goal.
+        "completion_rate": completion,
+        "comparable": completion >= COMPARABLE_COMPLETION,
         "completed": finished,
         "terminated": fell,
         "episodes": ended,
+        "live_steps": live_steps,
     }
+
+
+#: A tracking error measured while the robot keeps falling is not comparable to
+#: one measured while it completes, so below this the result is flagged rather
+#: than silently ranked against results from the other regime.
+COMPARABLE_COMPLETION = 0.99
+
+
+def evaluate_completion(checkpoint, train_cfg):
+    """Deprecated alias. `completion_rate` saturates; see evaluate_tracking."""
+    return evaluate_tracking(checkpoint, train_cfg)

@@ -35,8 +35,9 @@ sys.path.insert(0, str(HERE))
 import prepare  # noqa: E402  - read-only, owns the metric
 
 RESULTS = HERE / "results.tsv"
-HEADER = ("when\tnote\tcompletion_mean\tcompletion_spread\truns\t"
-          "baseline\tverdict\tdiff_lines\tscores\n")
+HEADER = ("when\tnote\ttracking_mean\ttracking_spread\truns\t"
+          "baseline\tverdict\tdiff_lines\tscores\troot_err_m\tee_err_m\t"
+          "completion\n")
 
 #: Results measured before the paired design existed are in
 #: `results-unpaired.tsv`. They are kept rather than deleted, and they are NOT
@@ -56,8 +57,9 @@ HEADER = ("when\tnote\tcompletion_mean\tcompletion_spread\truns\t"
 # material-binding warnings - the same substring-against-English mistake that
 # made newton-lab's check_parked fire on the word "policy" in a docstring.
 _ALWAYS = re.compile(
-    r"Traceback|\bError\b|\berror\b|\bassert|out of memory|\bKilled\b|"
+    r"Traceback|\bError\b|\bassert|out of memory|\bKilled\b|"
     r"\bNaN\b|\bnan\b|"
+    r"^tracking_error:|^root_error_m:|^ee_error_m:|^comparable:|"
     r"^completion_rate:|^completed:|^terminated:|^episodes:|^training_seconds:",
 )
 #: Progress. Throttled, because 300 iterations x several lines is 1500 lines
@@ -89,15 +91,22 @@ def run_once(index):
         env={**os.environ, "NEWTON_POLICY_RUN": str(index)},
     )
     score = None
+    extra = {}
     tail = collections.deque(maxlen=40)
     verbose = False
     for raw in proc.stdout:
         line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip()
         tail.append(line)
 
-        m = re.match(r"completion_rate:\s*([\d.]+)", line.strip())
+        m = re.match(r"tracking_error:\s*([\d.]+)", line.strip())
         if m:
             score = float(m.group(1))
+        m = re.match(r"(root_error_m|ee_error_m|completion_rate):\s*([\d.]+)",
+                     line.strip())
+        if m:
+            extra[m.group(1)] = float(m.group(2))
+        if line.strip().startswith("comparable:"):
+            extra["comparable"] = line.strip().split()[-1] == "True"
 
         p = _PROGRESS.search(line)
         if p:
@@ -117,11 +126,11 @@ def run_once(index):
             print(f"    {line}")
         return None
     if score is None:
-        print("  run produced no completion_rate - did train.py print the summary?")
+        print("  run produced no tracking_error - did train.py print the summary?")
         for line in tail:
             print(f"    {line}")
         return None
-    return score
+    return score, extra
 
 
 def baseline_from_results():
@@ -172,16 +181,31 @@ def main():
     if not RESULTS.exists():
         RESULTS.write_text(HEADER)
 
-    scores = []
+    scores, extras = [], []
     for i in range(args.repeats):
         seed = prepare.TRAIN_SEEDS[i % len(prepare.TRAIN_SEEDS)]
         print(f"[experiment] run {i + 1}/{args.repeats} (seed {seed}): {args.note}")
-        s = run_once(i)
-        if s is None:
+        got = run_once(i)
+        if got is None:
             print("[experiment] aborting - a run did not complete")
             return 1
-        print(f"  completion_rate {s:.4f}")
+        s, extra = got
         scores.append(s)
+        extras.append(extra)
+        print(f"  tracking_error {s:.5f}   root {extra.get('root_error_m', float('nan')):.5f}"
+              f"   ee {extra.get('ee_error_m', float('nan')):.5f}"
+              f"   completion {extra.get('completion_rate', float('nan')):.4f}")
+
+    # A tracking error measured while the robot keeps falling is not comparable
+    # to one measured while it completes - a falling policy spends more of its
+    # time near a reset, which reference state initialisation puts ON the
+    # reference. Measured: the 300-iteration checkpoint had the LOWEST root
+    # error in the whole budget curve purely by falling. Ranked naively it wins.
+    if any(e.get("comparable") is False for e in extras):
+        print("[experiment] NOT COMPARABLE: a run completed less than "
+              f"{prepare.COMPARABLE_COMPLETION:.0%} of its episodes, so its "
+              f"tracking error was measured in a different regime. Raise "
+              f"prepare.TRAIN_ITERATIONS rather than reading this as a result.")
 
     mean = statistics.fmean(scores)
     spread = (max(scores) - min(scores)) if len(scores) > 1 else 0.0
@@ -189,19 +213,14 @@ def main():
 
     if args.baseline or base is None:
         verdict = "BASELINE"
-        print(f"\n[experiment] BASELINE completion_rate {mean:.4f}  spread {spread:.4f}")
-        print(f"[experiment] per-seed {', '.join(f'{x:.4f}' for x in scores)}")
+        print(f"\n[experiment] BASELINE tracking_error {mean:.5f}  spread {spread:.5f}")
+        print(f"[experiment] per-seed {', '.join(f'{x:.5f}' for x in scores)}")
     elif len(base) != len(scores):
-        # Pairing is by POSITION, and position is seed. Different lengths mean
-        # the two arms did not face the same set of initialisations, so the
-        # difference would mix a real effect with a seed swap.
         print(f"\n[experiment] baseline has {len(base)} runs, this has "
               f"{len(scores)} - cannot pair. Re-run the baseline at "
               f"--repeats {args.repeats}.")
         return 1
     else:
-        # PAIRED: candidate run k against baseline run k, same seed, so the
-        # initialisation cancels instead of contributing to both arms.
         d = [c - b for c, b in zip(scores, base)]
         mean_d = statistics.fmean(d)
         paired_spread = (max(d) - min(d)) if len(d) > 1 else 0.0
@@ -211,29 +230,26 @@ def main():
         print()
         for k, (b, c, dk) in enumerate(zip(base, scores, d)):
             seed = prepare.TRAIN_SEEDS[k % len(prepare.TRAIN_SEEDS)]
-            print(f"[experiment] seed {seed}: {b:.4f} -> {c:.4f}   {dk:+.4f}")
-        print(f"[experiment] mean paired delta {mean_d:+.4f}   bar {bar:.4f}"
-              f"   (paired spread {paired_spread:.4f}, floor "
-              f"{'unmeasured' if floor is None else f'{floor:.4f}'})")
+            print(f"[experiment] seed {seed}: {b:.5f} -> {c:.5f}   {dk:+.5f}")
+        print(f"[experiment] mean paired delta {mean_d:+.5f}   bar {bar:.5f}"
+              f"   (paired spread {paired_spread:.5f}, floor "
+              f"{'unmeasured' if floor is None else f'{floor:.5f}'})")
 
-        # Direction has to agree across seeds. Two differences that clear a bar
-        # on average while pointing opposite ways is not an effect, it is two
-        # draws from a wide distribution that happened to average well.
         agree = all(x > 0 for x in d) or all(x < 0 for x in d)
         if not agree:
             verdict = "NEUTRAL"
             print("[experiment] seeds disagree on the SIGN - not an effect.")
-        elif mean_d > bar:
-            verdict = "KEEP"
+        # LOWER IS BETTER. tracking_error is an ERROR, so a NEGATIVE delta is
+        # an improvement - the opposite of completion_rate, which this replaced.
+        # Getting this backwards would rank every result upside down while
+        # still printing confident verdicts.
         elif mean_d < -bar:
+            verdict = "KEEP"
+        elif mean_d > bar:
             verdict = "DISCARD"
         else:
             verdict = "NEUTRAL"
 
-        # A bar built only from two paired differences can be arbitrarily small
-        # by luck, which is the same failure that made the unpaired results
-        # unreadable. Until the null experiment measures how far apart two runs
-        # of the SAME config on the SAME seed land, no verdict is trustworthy.
         if floor is None and verdict in ("KEEP", "DISCARD"):
             print(f"[experiment] would call {verdict}, but PAIRED_NOISE_FLOOR "
                   f"is unmeasured, so the bar has no floor and this may be "
@@ -246,12 +262,18 @@ def main():
             print("[experiment] inside the noise - this is not a result. "
                   "Record it and move on rather than re-running until it wins.")
 
-    base_mean = "" if base is None else f"{statistics.fmean(base):.4f}"
+    def avg(key):
+        vals = [e[key] for e in extras if isinstance(e.get(key), float)]
+        return statistics.fmean(vals) if vals else float("nan")
+
+    base_mean = "" if base is None else f"{statistics.fmean(base):.5f}"
     with RESULTS.open("a") as f:
         f.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\t"
-                f"{args.note}\t{mean:.4f}\t{spread:.4f}\t{args.repeats}\t"
+                f"{args.note}\t{mean:.5f}\t{spread:.5f}\t{args.repeats}\t"
                 f"{base_mean}\t{verdict}\t{diff_lines()}\t"
-                f"{','.join(f'{x:.4f}' for x in scores)}\n")
+                f"{','.join(f'{x:.5f}' for x in scores)}\t"
+                f"{avg('root_error_m'):.5f}\t{avg('ee_error_m'):.5f}\t"
+                f"{avg('completion_rate'):.4f}\n")
     print(f"[experiment] recorded in {RESULTS.name}")
     return 0
 

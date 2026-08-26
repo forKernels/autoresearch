@@ -111,9 +111,18 @@ def main():
 
     ckpt = out / f"model_{prepare.TRAIN_ITERATIONS - 1}.pt"
     runner.save(str(ckpt))
-    result = prepare.evaluate_completion(ckpt, build_train_cfg())
+    result = prepare.evaluate_tracking(ckpt, build_train_cfg())
 
     print("\n---")
+    # tracking_error is THE metric and LOWER IS BETTER. The other two are
+    # reported because they move in opposite directions: measured across one
+    # run's checkpoints, joint and end-effector error improve with training
+    # while ROOT error gets steadily worse (0.767 -> 0.941 m from iteration 750
+    # to 7999). A single number would hide that trade rather than show it.
+    print(f"tracking_error:   {result['tracking_error']:.5f}")
+    print(f"root_error_m:     {result['root_error_m']:.5f}")
+    print(f"ee_error_m:       {result['ee_error_m'] if result['ee_error_m'] is None else round(result['ee_error_m'], 5)}")
+    print(f"comparable:       {result['comparable']}")
     print(f"completion_rate:  {result['completion_rate']:.4f}")
     print(f"completed:        {result['completed']}")
     print(f"terminated:       {result['terminated']}")

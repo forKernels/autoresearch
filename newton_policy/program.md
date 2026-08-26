@@ -25,14 +25,71 @@ falls over.
 
 ## Experimentation
 
-One experiment is **300 iterations at 512 environments** — about five minutes at
-the measured ~11,200 environment-steps per second, so roughly twelve per hour.
-Run it as `uv run newton_policy/train.py`.
+One experiment is **1000 iterations at 512 environments** — about twenty minutes,
+so roughly three per hour. Run it as `uv run newton_policy/train.py`.
 
-**The goal: the highest `completion_rate`.**
+**The goal: the LOWEST `tracking_error`.**
 
-Of the episodes that ended, the share that ended by reaching the end of the clip
-rather than by falling over.
+Mean absolute joint deviation from the reference, in radians, over every step
+where the policy was live. **Lower is better** — the opposite direction from the
+metric this replaces, so a candidate that improves is one whose delta is
+NEGATIVE.
+
+### Why the budget is 1000 and not 300
+
+Measured on `runs/20260825-151727`, one run, one eval seed, budget the only
+variable:
+
+```
+ 300 -> completion 0.2960      750 -> 1.0000     2000 -> 1.0000
+ 500 -> completion 0.9841     1000 -> 1.0000     7999 -> 1.0000
+```
+
+There is a phase transition between 300 and 500. The old budget of 300 did not
+merely undertrain — it sat ON the cliff, the steepest part of the curve, where
+slightly more training is a great deal more completion. That is why two runs of
+an identical config scattered by 0.13 and why six consecutive experiments
+resolved nothing at all.
+
+### Why the metric is no longer `completion_rate`
+
+Because it saturates. From ~750 iterations every policy finishes every episode —
+1228 of them, zero terminations, identically — so the number cannot tell a good
+policy from a perfect one. Below ~500 it is on the cliff and measures mostly
+noise. Its useful range is roughly 200 iterations wide.
+
+That makes it the **third** metric on this project bounded by something other
+than policy quality: `mean episode length` by the sampling scheme,
+`completion_rate` by saturation. Tracking error is bounded by neither. Measured
+across the five checkpoints that all complete 100% of episodes, it spans 3.02x.
+
+### Read all three numbers, not just the first
+
+`train.py` reports `root_error_m` and `ee_error_m` beside `tracking_error`, and
+they do not move together. Across one run's checkpoints:
+
+```
+iter    tracking_err   root_err_m   ee_err_m
+ 750         0.04160      0.76729    0.03216
+2000         0.04742      0.90544    0.02330
+7999         0.02233      0.94145    0.01988
+```
+
+Joint and end-effector tracking improve with training; **ROOT position tracking
+gets steadily worse** - 0.94 m of drift on a 3.06 m walk, still growing at 8000
+iterations with `k_root` in the reward the whole time. The policy is buying limb
+accuracy with body drift.
+
+So a candidate that lowers `tracking_error` while raising `root_error_m` has
+traded, not improved. Say so rather than reporting the win.
+
+### `comparable` is a guard, not a formality
+
+A tracking error measured while the robot keeps falling is not comparable to one
+measured while it completes: a falling policy spends more of its time near a
+reset, and reference state initialisation puts that reset exactly ON the
+reference. Measured — the 300-iteration checkpoint had the LOWEST root error in
+the entire budget curve, purely by falling. Ranked naively, it wins.
 
 ### What you CAN change
 
@@ -75,8 +132,12 @@ So: **if a metric will not move, suspect the metric before the fifth
 hypothesis.** And when several changes produce the same number, that sameness is
 itself the finding.
 
-`completion_rate` is bounded by the policy. `terminations()` already returned
-`failed` and `timed_out` separately the whole time; nobody printed them.
+`terminations()` already returned `failed` and `timed_out` separately the whole
+time; nobody printed them.
+
+And then `completion_rate`, which fixed that, turned out to be bounded too — by
+saturation rather than by sampling. **Ask of any metric: what ELSE could pin
+this number?** Twice now the answer was something other than the policy.
 
 ## Running an experiment
 
@@ -135,14 +196,18 @@ so prefer a change that DERIVES a value over one that hardcodes it.
 
 ```
 ---
-completion_rate:  0.8734
-completed:        1203
-terminated:       174
-episodes:         1377
-training_seconds: 298.4
-iterations:       300
+tracking_error:   0.02233
+root_error_m:     0.94145
+ee_error_m:       0.01988
+comparable:       True
+completion_rate:  1.0000
+completed:        1228
+terminated:       0
+episodes:         1228
+training_seconds: 1198.4
+iterations:       1000
 envs:             512
 ```
 
-Record `completion_rate` in `results.tsv` along with what changed and whether it
-was kept.
+`experiment.py` records all of them. `tracking_error` decides the verdict;
+the other three are how you tell an improvement from a trade.
