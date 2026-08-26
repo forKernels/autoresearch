@@ -78,6 +78,24 @@ itself the finding.
 `completion_rate` is bounded by the policy. `terminations()` already returned
 `failed` and `timed_out` separately the whole time; nobody printed them.
 
+## Running an experiment
+
+Use the runner, not `train.py` directly:
+
+    uv run newton_policy/experiment.py --baseline --note "unmodified"
+    uv run newton_policy/experiment.py --note "lookahead 0/100/300/600ms"
+
+It runs the experiment `EVAL_REPEATS` times, compares the mean against the
+recorded baseline using the larger of the two spreads as the bar, appends a row
+to `results.tsv`, and prints KEEP / DISCARD / NEUTRAL.
+
+**It does not touch git.** Deciding what to keep is yours and should stay
+visible in the diff.
+
+**A NEUTRAL is a result.** Record it and move on. Re-running a candidate until
+it happens to clear the bar is how a noisy metric gets mistaken for a finding,
+and this project has already paid for that lesson once.
+
 ## Accepting a change
 
 The physics is **not deterministic**. The WS-1 handoff measured 3% between two
