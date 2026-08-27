@@ -92,9 +92,21 @@ TRAIN_SEEDS = (20260826, 19720305)
 #: `tracking_error` ran 0.02-0.07, so carrying the old number would set a bar
 #: a fifth of the entire range wide. A noise floor belongs to the metric it was
 #: measured on, exactly as a baseline belongs to the task it was measured on.
-#: Measured by the null experiment on `tracking_score` at
-#: TRAIN_ITERATIONS=1000. Paired differences -0.01142, +0.01649.
-PAIRED_NOISE_FLOOR = 0.01649
+#: Measured by the null experiment on `tracking_score` WITH the end-effector
+#: factor, at TRAIN_ITERATIONS=1000. Paired differences +0.00551, -0.03589.
+#:
+#: Read those two numbers before trusting this bar. Seed 20260826 reproduced to
+#: +0.00551; seed 19720305 moved -0.03589 on an identical re-run of an
+#: identical config. Same seed, same code, 6.5x the spread - the physics
+#: nondeterminism `_seed_training` warns about, and NOT mode-mixing: every run
+#: in the null sat at root_err_m ~0.08, all of them walking.
+#:
+#: This is `max |paired difference|` over n=2, which is the weakest part of the
+#: harness. The max of two samples has no confidence attached and inherits the
+#: worse draw wholesale, so one outlier set a bar ~20x the k_ee effect size. A
+#: real paired test needs EVAL_REPEATS well above 2; until then this number is
+#: a placeholder that errs toward NEUTRAL, which is the safe direction to err.
+PAIRED_NOISE_FLOOR = 0.03589
 
 
 def _seed_training():
@@ -184,8 +196,25 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     no penalties: those are knobs, and a knob inside the scoring function
     rewards itself.
 
-    `k_root_vel` is deliberately NOT scored, for the same reason. It is a
-    candidate's term; what it BUYS shows up in the root factor, which is scored.
+    `k_root_vel` is NOT scored: it is a candidate's term, and what it BUYS shows
+    up in the root factor, which is.
+
+    The END-EFFECTOR term IS scored, and its absence was a mistake worth
+    recording. It was left out on the reasoning that "a knob inside the scoring
+    function rewards itself" - but that applies to the candidate's TRAINING
+    weight, not to the quantity. `k_root` is scored at a fixed weight here while
+    `k_root_vel` is the candidate, and that arrangement works; end effectors
+    needed exactly the same one. Without it the scorer was
+    joint x vel x root x ori, so a `k_ee` candidate could only ever LOWER the
+    score - spending scored terms to improve an unscored one. Measured: k_ee cut
+    end-effector error 21% on both seeds, consistently, and scored NEUTRAL
+    because the improvement was invisible to the metric.
+
+    Note what this makes incomparable: a clip WITHOUT `body_positions` has no
+    end-effector factor at all, so its scores cannot be compared against a clip
+    that has one. The factor is bounded (0, 1], so adding it can only lower the
+    absolute number - which is why the baseline and the floor are re-measured
+    whenever the scorer changes.
 
     Why it replaces `completion_rate`, which is still reported below as a
     guard: completion saturates. Past ~750 iterations every policy finishes
@@ -270,7 +299,8 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     # and has to scale to the robot: carrying a 0.265 m robot's value onto a
     # 0.76 m one collapses the product for an ordinary lag.
     scorer = m["reward"].TrackingReward(
-        k_root=m["reward"].k_root_for_height(env.standing_height))
+        k_root=m["reward"].k_root_for_height(env.standing_height),
+        k_ee=m["reward"].k_ee_for_height(env.standing_height))
     has_ee = bool(getattr(env.reference, "has_body_positions", False))
 
     for _ in range(EVAL_STEPS):
@@ -300,15 +330,16 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
                 tm = scorer.terms(q, q_ref, env.actuated_dq()[live],
                                   env._ref(env.reference.dq)[live],
                                   root, root_ref)
-                score_sum += float((tm["joint"] * tm["vel"]
-                                    * tm["root"] * tm["ori"]).sum())
+                score = tm["joint"] * tm["vel"] * tm["root"] * tm["ori"]
 
                 if has_ee:
                     ee = env.end_effector_positions()
                     if ee is not None:
-                        ee_sum += float((ee[live] -
-                                         env._ref(env.reference.body)[live]
-                                         ).norm(dim=-1).mean(dim=-1).sum())
+                        ee, ee_ref = ee[live], env._ref(env.reference.body)[live]
+                        ee_sum += float(
+                            (ee - ee_ref).norm(dim=-1).mean(dim=-1).sum())
+                        score = score * scorer.end_effector_term(ee, ee_ref)
+                score_sum += float(score.sum())
                 live_steps += n_live
 
     ended = fell + finished
