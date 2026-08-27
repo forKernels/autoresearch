@@ -189,10 +189,11 @@ def test_floor_is_unmeasured_after_the_statistic_changed():
     """max|d| over n=2 does not transfer to a t-test over n=6.
 
     A noise floor belongs to the statistic it was measured on, exactly as it
-    belongs to the metric it was measured on. Delete this test when the null
-    experiment has been re-run at the new repeat count and the floor re-set.
+    belongs to the metric it was measured on - which is now enforced by
+    PAIRED_NOISE_FLOORS being keyed by metric. Delete this test when the null
+    experiment has been re-run at the new repeat count and the floors re-set.
     """
-    assert prepare.PAIRED_NOISE_FLOOR is None
+    assert prepare.PAIRED_NOISE_FLOORS["tracking_score"] is None
 
 
 def test_mode_fault_names_the_problem():
@@ -240,3 +241,102 @@ def test_no_baseline_at_all_returns_none(tmp_path):
         assert experiment.baseline_from_results() is None
     finally:
         experiment.RESULTS = old
+
+
+# --- per-metric direction and floors -----------------------------------------
+
+def test_every_reported_metric_declares_a_direction():
+    """Direction belongs to the METRIC, not to the comparison.
+
+    It has been got wrong twice - completion_rate up, tracking_error down,
+    tracking_score up - and each time the harness printed confident verdicts
+    that were upside down. Putting it in a table beside the metric is the only
+    fix that does not depend on remembering.
+    """
+    assert prepare.METRICS["tracking_score"] == +1
+    for lower_is_better in ("tracking_error", "root_error_m",
+                            "ori_error_rad", "vel_error", "ee_error_m"):
+        assert prepare.METRICS[lower_is_better] == -1
+
+
+def test_a_lower_is_better_metric_keeps_on_a_NEGATIVE_delta():
+    """k_ee cutting ee error is an IMPROVEMENT and must read KEEP."""
+    d = [-0.0135, -0.0130, -0.0141, -0.0138, -0.0132, -0.0136]
+    v, _ = experiment.verdict(d, 0.002, WALK6, direction=-1)
+    assert v == "KEEP"
+
+
+def test_a_lower_is_better_metric_discards_on_a_POSITIVE_delta():
+    d = [0.0135, 0.0130, 0.0141, 0.0138, 0.0132, 0.0136]
+    v, _ = experiment.verdict(d, 0.002, WALK6, direction=-1)
+    assert v == "DISCARD"
+
+
+def test_direction_defaults_to_higher_is_better():
+    """tracking_score is the default target, so the default must match it."""
+    d = [0.020, 0.021, 0.019, 0.022, 0.018, 0.020]
+    assert experiment.verdict(d, FLOOR, WALK6)[0] == "KEEP"
+
+
+def test_floors_are_per_metric_because_units_differ():
+    """A floor measured on a bounded (0,1] score cannot bound a metric in
+    METRES. Carrying one across is the mistake this constant already made
+    twice, in a new costume."""
+    assert set(prepare.PAIRED_NOISE_FLOORS) == set(prepare.METRICS)
+    for metric, floor in prepare.PAIRED_NOISE_FLOORS.items():
+        assert floor is None, f"{metric} floor must be re-measured, not guessed"
+
+
+# --- per-seed ledger round-trip ----------------------------------------------
+
+def _row(verdict, per_seed, scores="0.11111,0.22222"):
+    return ("2026-08-27T00:00:00+00:00\tnote\t0.5\t0.01\t2\t\t"
+            f"{verdict}\t0\t{scores}\t0.0\t0.0\t0.0\t1.0\twalking,walking\t"
+            f"{per_seed}\n")
+
+
+def test_per_seed_round_trips_for_every_metric(tmp_path):
+    """A mean cannot be un-averaged, which is why per-seed is recorded.
+
+    Pairing on ee_error_m needs the baseline's PER-SEED ee values; results.tsv
+    stored only the arm mean until this column existed.
+    """
+    per_seed = ("ee_error_m:0.055,0.058;tracking_score:0.869,0.894;"
+                "root_error_m:0.080,0.081")
+    results = tmp_path / "results.tsv"
+    results.write_text(experiment.HEADER + _row("BASELINE", per_seed))
+    old = experiment.RESULTS
+    try:
+        experiment.RESULTS = results
+        assert experiment.baseline_from_results("ee_error_m") == [0.055, 0.058]
+        assert experiment.baseline_from_results("tracking_score") == [0.869, 0.894]
+        # A metric the baseline never recorded is absent, not silently faked.
+        assert experiment.baseline_from_results("vel_error") is None
+    finally:
+        experiment.RESULTS = old
+
+
+def test_a_legacy_row_still_pairs_on_tracking_score(tmp_path):
+    """Rows written before per-seed existed have 13 columns, not 14.
+
+    They must stay usable for the metric they DID record, and report absent -
+    never a mean, never a zero - for the others.
+    """
+    legacy = ("2026-08-27T00:00:00+00:00\tnote\t0.88\t0.02\t2\t\tBASELINE\t0\t"
+              "0.86985,0.89421\t0.07\t0.08\t0.055\t1.0\n")
+    results = tmp_path / "results.tsv"
+    results.write_text(experiment.HEADER + legacy)
+    old = experiment.RESULTS
+    try:
+        experiment.RESULTS = results
+        assert experiment.baseline_from_results("tracking_score") == [0.86985, 0.89421]
+        assert experiment.baseline_from_results("ee_error_m") is None
+    finally:
+        experiment.RESULTS = old
+
+
+def test_malformed_per_seed_does_not_take_down_a_run():
+    assert experiment._parse_per_seed("") == {}
+    assert experiment._parse_per_seed("garbage") == {}
+    assert experiment._parse_per_seed("ee_error_m:not,numbers") == {}
+    assert experiment._parse_per_seed("a:1,2;b:3") == {"a": [1.0, 2.0], "b": [3.0]}

@@ -41,7 +41,11 @@ RESULTS = HERE / "results.tsv"
 TRAIN_SCRIPT = HERE / "train.py"
 HEADER = ("when\tnote\tscore_mean\tscore_spread\truns\t"
           "baseline\tverdict\tdiff_lines\tscores\ttrack_err\troot_err_m\t"
-          "ee_err_m\tcompletion\tmodes\n")
+          "ee_err_m\tcompletion\tmodes\tper_seed\n")
+
+#: Index of the `per_seed` column in RESULTS. Derived from HEADER rather than
+#: written by hand, so extending the row cannot silently repoint it.
+PER_SEED_COL = HEADER.rstrip("\n").split("\t").index("per_seed")
 
 #: Results measured before the paired design existed are in
 #: `results-unpaired.tsv`. They are kept rather than deleted, and they are NOT
@@ -105,8 +109,8 @@ def run_once(index):
         m = re.match(r"tracking_score:\s*([\d.]+)", line.strip())
         if m:
             score = float(m.group(1))
-        m = re.match(r"(tracking_error|root_error_m|ee_error_m|completion_rate)"
-                     r":\s*([\d.]+)", line.strip())
+        m = re.match(r"(tracking_error|root_error_m|ee_error_m|ori_error_rad"
+                     r"|vel_error|completion_rate):\s*([\d.]+)", line.strip())
         if m:
             extra[m.group(1)] = float(m.group(2))
         if line.strip().startswith("comparable:"):
@@ -210,7 +214,7 @@ def mode_fault(modes):
     return None
 
 
-def verdict(d, floor, modes):
+def verdict(d, floor, modes, direction=+1):
     """The call, from the differences, the floor, and which policies were found.
 
     Mode comes FIRST and outranks the statistics, because an arm that found two
@@ -226,6 +230,10 @@ def verdict(d, floor, modes):
     and worth keeping are different claims. Without a measured floor the second
     gate cannot be applied at all, so a resolvable effect reports UNCALIBRATED
     rather than borrowing a bar from a statistic it was not measured on.
+
+    `direction` is +1 for higher-is-better and -1 for lower-is-better, and it
+    belongs to the METRIC - `prepare.METRICS` - not to this comparison. Callers
+    pass it through; nothing here decides it.
     """
     st = paired_test(d)
     fault = mode_fault(modes)
@@ -237,10 +245,28 @@ def verdict(d, floor, modes):
         return "UNCALIBRATED", st
     if abs(st["mean"]) <= floor:
         return "NEUTRAL", st
-    return ("KEEP" if st["mean"] > 0 else "DISCARD"), st
+    # `direction` comes from prepare.METRICS, never from a comparison written
+    # here. tracking_score is higher-better and ee_error_m is lower-better, so
+    # a hardcoded `> 0` is right for exactly one of the metrics this now tests
+    # and silently inverts every verdict on the others.
+    return ("KEEP" if st["mean"] * direction > 0 else "DISCARD"), st
 
 
-def baseline_from_results():
+def _parse_per_seed(cell):
+    """`name:v,v,v;name:v,v,v` -> {name: [floats]}. Empty cell -> {}."""
+    out = {}
+    for part in cell.strip().split(";"):
+        if ":" not in part:
+            continue
+        name, _, vals = part.partition(":")
+        try:
+            out[name.strip()] = [float(x) for x in vals.split(",") if x.strip()]
+        except ValueError:
+            continue
+    return out
+
+
+def baseline_from_results(metric="tracking_score"):
     """Per-seed scores of the MOST RECENT baseline row, not the first.
 
     Returns the individual run scores rather than a mean, because the
@@ -259,8 +285,21 @@ def baseline_from_results():
         return None
     rows = [r.split("\t") for r in RESULTS.read_text().splitlines()[1:] if r.strip()]
     for r in reversed(rows):
-        if len(r) > 8 and r[6] == "BASELINE" and r[8].strip():
-            return [float(x) for x in r[8].split(",")]
+        if not (len(r) > 8 and r[6] == "BASELINE" and r[8].strip()):
+            continue
+        # Rows written before per-seed recording carry only tracking_score, in
+        # column 8. They stay usable for that metric and are simply absent for
+        # the others - which is the honest answer, not a fallback to a mean.
+        #
+        # PER_SEED_COL is named rather than inlined: it was written as 13 first
+        # (the index before `modes` was added) and silently returned the modes
+        # column, which parses to {} and looks exactly like "not recorded".
+        per_seed = _parse_per_seed(r[PER_SEED_COL]) if len(r) > PER_SEED_COL else {}
+        if metric in per_seed:
+            return per_seed[metric]
+        if metric != "tracking_score":
+            return None
+        return [float(x) for x in r[8].split(",")]
     return None
 
 
@@ -283,6 +322,12 @@ def main():
     ap.add_argument("--baseline", action="store_true",
                     help="record this run as THE baseline to compare against")
     ap.add_argument("--repeats", type=int, default=prepare.EVAL_REPEATS)
+    ap.add_argument("--target", default="tracking_score",
+                    choices=sorted(prepare.METRICS),
+                    help="the metric the VERDICT is read from. Pre-register it: "
+                         "one primary, chosen before the run. Every other metric "
+                         "is reported as a guard, never as a verdict, so five "
+                         "simultaneous tests cannot be mined for a winner.")
     args = ap.parse_args()
 
     if not RESULTS.exists():
@@ -314,6 +359,21 @@ def main():
               f"tracking error was measured in a different regime. Raise "
               f"prepare.TRAIN_ITERATIONS rather than reading this as a result.")
 
+    # Per-metric, per-run. tracking_score arrives separately because run_once
+    # parses it as the score; the rest ride in `extra`.
+    per_metric = {"tracking_score": list(scores)}
+    for name in prepare.METRICS:
+        if name == "tracking_score":
+            continue
+        vals = [e.get(name) for e in extras]
+        if all(isinstance(v, float) for v in vals):
+            per_metric[name] = vals
+
+    if args.target not in per_metric:
+        print(f"\n[experiment] target {args.target!r} was not reported by every "
+              f"run - cannot pair on it.")
+        return 1
+
     modes = [e.get("mode", "unknown") for e in extras]
     if len(set(modes)) > 1:
         print(f"\n[experiment] MIXED MODES: {', '.join(modes)}")
@@ -329,7 +389,8 @@ def main():
 
     mean = statistics.fmean(scores)
     spread = (max(scores) - min(scores)) if len(scores) > 1 else 0.0
-    base = baseline_from_results()
+    target_vals = per_metric[args.target]
+    base = baseline_from_results(args.target)
 
     if args.baseline or base is None:
         # A baseline that is bimodal, or that is standing still, would make
@@ -344,18 +405,21 @@ def main():
             print(f"[experiment] NOT recorded as a usable baseline ({fault}) - "
                   f"nothing can be paired against this. Fix the arm and re-run "
                   f"before measuring any candidate against it.")
-    elif len(base) != len(scores):
+    elif len(base) != len(target_vals):
         print(f"\n[experiment] baseline has {len(base)} runs, this has "
-              f"{len(scores)} - cannot pair. Re-run the baseline at "
+              f"{len(target_vals)} - cannot pair. Re-run the baseline at "
               f"--repeats {args.repeats}.")
         return 1
     else:
-        d = [c - b for c, b in zip(scores, base)]
-        floor = prepare.PAIRED_NOISE_FLOOR
-        call, st = verdict(d, floor, modes)
+        d = [c - b for c, b in zip(target_vals, base)]
+        floor = prepare.PAIRED_NOISE_FLOORS[args.target]
+        direction = prepare.METRICS[args.target]
+        call, st = verdict(d, floor, modes, direction)
 
         print()
-        for k, (b, c, dk) in enumerate(zip(base, scores, d)):
+        arrow = "higher is better" if direction > 0 else "LOWER is better"
+        print(f"[experiment] target {args.target} ({arrow})")
+        for k, (b, c, dk) in enumerate(zip(base, target_vals, d)):
             seed = prepare.TRAIN_SEEDS[k % len(prepare.TRAIN_SEEDS)]
             print(f"[experiment] seed {seed}: {b:.5f} -> {c:.5f}   "
                   f"{dk:+.5f}   {modes[k]}")
@@ -381,7 +445,24 @@ def main():
                   "null experiment) at these repeats, then set "
                   "prepare.PAIRED_NOISE_FLOOR from its |mean paired delta|.")
 
-        print(f"[experiment] VERDICT: {call}")
+        # Guards. Reported, never a verdict: the primary was pre-registered
+        # above, and promoting whichever of five deltas happens to clear its
+        # bar is exactly the mining this harness exists to prevent.
+        for name in sorted(per_metric):
+            if name == args.target:
+                continue
+            gbase = baseline_from_results(name)
+            if not gbase or len(gbase) != len(per_metric[name]):
+                continue
+            gd = [c - b for c, b in zip(per_metric[name], gbase)]
+            gst = paired_test(gd)
+            way = "+" if prepare.METRICS[name] > 0 else "-"
+            better = "better" if gst["mean"] * prepare.METRICS[name] > 0 else "worse"
+            mark = "resolves" if gst["significant"] else "in noise"
+            print(f"[experiment] guard {name:>15} ({way}) "
+                  f"{gst['mean']:+.5f}  {better:>6}, {mark}")
+
+        print(f"[experiment] VERDICT: {call}  [{args.target}]")
         if call == "NEUTRAL":
             print("[experiment] inside the noise - this is not a result. "
                   "Record it and move on rather than re-running until it wins.")
@@ -399,7 +480,11 @@ def main():
                 f"{avg('tracking_error'):.5f}\t{avg('root_error_m'):.5f}\t"
                 f"{avg('ee_error_m'):.5f}\t"
                 f"{avg('completion_rate'):.4f}\t"
-                f"{','.join(modes)}\n")
+                f"{','.join(modes)}\t"
+                # Per-seed, per-metric, so ANY metric can be paired later
+                # without re-running - a mean cannot be un-averaged.
+                + ";".join(f"{n}:" + ",".join(f"{v:.6g}" for v in vs)
+                           for n, vs in sorted(per_metric.items())) + "\n")
     print(f"[experiment] recorded in {RESULTS.name}")
     return 0
 

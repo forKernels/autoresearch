@@ -134,6 +134,8 @@ def main():
     print(f"tracking_error:   {result['tracking_error']:.5f}")
     print(f"root_error_m:     {result['root_error_m']:.5f}")
     print(f"ee_error_m:       {result['ee_error_m'] if result['ee_error_m'] is None else round(result['ee_error_m'], 5)}")
+    print(f"ori_error_rad:    {result['ori_error_rad']:.5f}")
+    print(f"vel_error:        {result['vel_error']:.5f}")
     print(f"comparable:       {result['comparable']}")
     # WHICH policy this run found. `experiment.py` parses this line: an arm
     # whose seeds report different modes gets no verdict, because its spread is

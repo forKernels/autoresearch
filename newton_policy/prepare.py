@@ -127,7 +127,41 @@ TRAIN_SEEDS = (20260826, 19720305, 20250413, 19680721,
 #: reports UNCALIBRATED instead. Re-measure it by running the baseline AGAIN
 #: as a candidate (a null experiment) at EVAL_REPEATS=6 and setting this to
 #: the |mean paired delta| that null produces.
-PAIRED_NOISE_FLOOR = None
+#: Every metric an arm reports, and WHICH WAY IS BETTER.
+#:
+#: Direction belongs to the metric, in a table, because it has been got wrong
+#: twice - completion_rate up, then tracking_error down, then tracking_score up
+#: - and each flip printed confident verdicts that were ranked upside down. A
+#: comparison that reads its direction from here cannot get it wrong by being
+#: written from memory.
+#:
+#: The error terms are reported for their own sake, not as decoration. The
+#: composite is a PRODUCT of five bounded factors, so a candidate that improves
+#: one of them moves it by that factor's weight and is diluted by the other
+#: four; measuring the term the candidate targets is strictly the better
+#: estimator, and needs no rescaling of anything to be so.
+METRICS = {
+    "tracking_score": +1,   # bounded (0, 1], the composite
+    "tracking_error": -1,   # rad, mean absolute joint deviation
+    "root_error_m":   -1,   # metres
+    "ori_error_rad":  -1,   # rad, root tilt
+    "vel_error":      -1,   # rad/s, mean absolute joint velocity deviation
+    "ee_error_m":     -1,   # metres, mean over end effectors
+}
+
+#: The paired noise floor, PER METRIC. All unmeasured.
+#:
+#: Per metric because a floor carries units. 0.03589 was measured on a bounded
+#: (0, 1] score; applied to `ee_error_m`, which runs 0.04-0.06 METRES, it would
+#: be a bar wider than the entire range of the quantity - the identical mistake
+#: this constant already made when 0.1329 from `completion_rate` was nearly
+#: carried onto `tracking_error`, in a new costume.
+#:
+#: `experiment.py` refuses KEEP or DISCARD on a metric whose floor is None and
+#: reports UNCALIBRATED. Re-measure by running the baseline AGAIN as a
+#: candidate - a null experiment - and setting each entry from the |mean paired
+#: delta| that null produces FOR THAT METRIC.
+PAIRED_NOISE_FLOORS = {name: None for name in METRICS}
 
 
 def _seed_training():
@@ -314,6 +348,7 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     obs, _ = vec.reset()
     fell = finished = 0
     joint_sum = root_sum = ee_sum = score_sum = 0.0
+    ori_sum = vel_sum = 0.0
     live_steps = 0
 
     # The scorer, with weights pinned above and built HERE. k_root is in METRES
@@ -347,10 +382,18 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
                 root_sum += float(
                     (root[:, :3] - root_ref[:, :3]).norm(dim=-1).sum())
 
+                # Hoisted so the reported per-term error and the scorer's own
+                # factor are computed from the SAME tensors. Two reads of
+                # `actuated_dq()` would be two different quantities the moment
+                # anything about the env became stateful.
+                dq = env.actuated_dq()[live]
+                dq_ref = env._ref(env.reference.dq)[live]
+                vel_sum += float((dq - dq_ref).abs().mean(dim=-1).sum())
+                ori_sum += float(m["reward"].quaternion_angle(
+                    root[:, 3:], root_ref[:, 3:]).sum())
+
                 # `tm`, not `t` - `t` is the time-outs mask a few lines up.
-                tm = scorer.terms(q, q_ref, env.actuated_dq()[live],
-                                  env._ref(env.reference.dq)[live],
-                                  root, root_ref)
+                tm = scorer.terms(q, q_ref, dq, dq_ref, root, root_ref)
                 score = tm["joint"] * tm["vel"] * tm["root"] * tm["ori"]
 
                 if has_ee:
@@ -373,6 +416,11 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
         # robot above a walking one.
         "tracking_error": (joint_sum / live_steps) if live_steps else float("inf"),
         "root_error_m": root_error_m,
+        # Reported per term so the candidate's OWN quantity can be tested
+        # directly, paired by seed, instead of being read off a five-way
+        # product that dilutes it. See METRICS.
+        "ori_error_rad": (ori_sum / live_steps) if live_steps else float("inf"),
+        "vel_error": (vel_sum / live_steps) if live_steps else float("inf"),
         "ee_error_m": (ee_sum / live_steps) if (has_ee and live_steps) else None,
         # The guard, not the goal.
         "completion_rate": completion,
