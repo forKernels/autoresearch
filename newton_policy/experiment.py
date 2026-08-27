@@ -22,6 +22,7 @@ what to keep is the agent's job and should stay visible.
 
 import argparse
 import collections
+import math
 import os
 import re
 import statistics
@@ -35,9 +36,12 @@ sys.path.insert(0, str(HERE))
 import prepare  # noqa: E402  - read-only, owns the metric
 
 RESULTS = HERE / "results.tsv"
+#: The training entry point, as a module-level name so an end-to-end test can
+#: point it at a shortened run. Nothing else should rebind it.
+TRAIN_SCRIPT = HERE / "train.py"
 HEADER = ("when\tnote\tscore_mean\tscore_spread\truns\t"
           "baseline\tverdict\tdiff_lines\tscores\ttrack_err\troot_err_m\t"
-          "ee_err_m\tcompletion\n")
+          "ee_err_m\tcompletion\tmodes\n")
 
 #: Results measured before the paired design existed are in
 #: `results-unpaired.tsv`. They are kept rather than deleted, and they are NOT
@@ -85,7 +89,7 @@ def run_once(index):
     is parsed on the way past, so nothing is lost by showing it.
     """
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(HERE / "train.py")],
+        [sys.executable, "-u", str(TRAIN_SCRIPT)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
         env={**os.environ, "NEWTON_POLICY_RUN": str(index)},
@@ -107,6 +111,8 @@ def run_once(index):
             extra[m.group(1)] = float(m.group(2))
         if line.strip().startswith("comparable:"):
             extra["comparable"] = line.strip().split()[-1] == "True"
+        if line.strip().startswith("mode:"):
+            extra["mode"] = line.strip().split()[-1]
 
         p = _PROGRESS.search(line)
         if p:
@@ -131,6 +137,107 @@ def run_once(index):
             print(f"    {line}")
         return None
     return score, extra
+
+
+#: Two-sided 95% critical values of Student's t, by degrees of freedom.
+#:
+#: Tabulated rather than imported because scipy on this box is an ABI hazard -
+#: the apt build is linked against numpy 1 and this project pins numpy 2 - and
+#: because a t-table is eight lines and does not need a dependency that can
+#: break the harness at 3am. df>20 falls back to the normal limit; nothing here
+#: runs anywhere near that many repeats.
+T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+             6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+             11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+             16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086}
+
+
+def paired_test(d):
+    """Paired t-test on the per-seed differences. Pure arithmetic, tested.
+
+    Replaces two n=2 heuristics that between them decided every verdict this
+    project has recorded:
+
+      1. `all(x > 0) or all(x < 0)` - unanimity of sign. At n=2 this is a coin
+         flip on the noisier seed. It is what rejected k_ee: the differences
+         were +0.01870 and -0.01524, and the negative one exists because the
+         BASELINE drew 0.89421 on that seed while its own null re-run of the
+         same seed drew 0.85832. Measured against the null's draw instead, both
+         seeds agree and the sign rule passes. A verdict should not depend on
+         which of two equally valid baseline draws a candidate was paired with.
+      2. `bar = max(paired_spread, floor)` - beat the worse of two draws. Has
+         no confidence attached and grows with the outlier it is meant to guard
+         against.
+
+    Both are subsumed here: consistency of sign shows up as a small standard
+    error, and an outlier inflates it honestly instead of becoming the bar.
+
+    `significant` is |t| > crit at two-sided 95%. Two-sided on purpose: a
+    candidate that makes things reliably WORSE is a result worth recording, and
+    a one-sided test at the same alpha would be a looser bar for KEEP than the
+    number suggests.
+    """
+    n = len(d)
+    mean = statistics.fmean(d) if n else 0.0
+    if n < 2:
+        return {"n": n, "mean": mean, "sd": None, "se": None,
+                "t": None, "df": None, "crit": None, "significant": False}
+    sd = statistics.stdev(d)
+    se = sd / math.sqrt(n)
+    df = n - 1
+    crit = T_CRIT_95.get(df, 1.96)
+    # se == 0 means every seed moved by exactly the same amount. That is either
+    # a deterministic effect (mean != 0) or nothing at all (mean == 0); it is
+    # not a division to guard against by returning "no result".
+    t = (mean / se) if se else (math.inf if mean else 0.0)
+    return {"n": n, "mean": mean, "sd": sd, "se": se,
+            "t": t, "df": df, "crit": crit, "significant": abs(t) > crit}
+
+
+def mode_fault(modes):
+    """What is wrong with this arm's MODES, or None if its runs agree and walk.
+
+    One place, because the baseline branch and the candidate branch have to
+    answer it identically. They did not at first: a mixed baseline was refused
+    and a uniformly-standing one was recorded as usable, which is the worse of
+    the two - every later candidate would then be paired against a robot
+    standing still.
+    """
+    if modes and len(set(modes)) > 1:
+        return "MIXED"
+    if modes and modes[0] == "standing":
+        return "DEGENERATE"
+    return None
+
+
+def verdict(d, floor, modes):
+    """The call, from the differences, the floor, and which policies were found.
+
+    Mode comes FIRST and outranks the statistics, because an arm that found two
+    different policies did not measure one thing noisily - it measured two
+    things. k_root_vel=20 scored 0.33009 and 0.87239; averaging those to 0.60124
+    and reporting NEUTRAL says "no effect" about a run that half the time
+    collapsed to standing still. That is a bistability to report, not noise to
+    average, and the floor does not apply across modes.
+
+    Significance and size are then separate gates, in that order. A difference
+    the test cannot resolve is NEUTRAL whatever its size; a difference it CAN
+    resolve but that lands under the floor is also NEUTRAL, because resolvable
+    and worth keeping are different claims. Without a measured floor the second
+    gate cannot be applied at all, so a resolvable effect reports UNCALIBRATED
+    rather than borrowing a bar from a statistic it was not measured on.
+    """
+    st = paired_test(d)
+    fault = mode_fault(modes)
+    if fault:
+        return fault, st
+    if not st["significant"]:
+        return "NEUTRAL", st
+    if floor is None:
+        return "UNCALIBRATED", st
+    if abs(st["mean"]) <= floor:
+        return "NEUTRAL", st
+    return ("KEEP" if st["mean"] > 0 else "DISCARD"), st
 
 
 def baseline_from_results():
@@ -207,14 +314,36 @@ def main():
               f"tracking error was measured in a different regime. Raise "
               f"prepare.TRAIN_ITERATIONS rather than reading this as a result.")
 
+    modes = [e.get("mode", "unknown") for e in extras]
+    if len(set(modes)) > 1:
+        print(f"\n[experiment] MIXED MODES: {', '.join(modes)}")
+        print("[experiment] this arm found more than one policy, so its seeds "
+              "did not measure the same thing and their spread is a "
+              "mode-switch rate rather than an error bar. Report the "
+              "bistability; do not average across it.")
+    elif modes and modes[0] == "standing":
+        print(f"\n[experiment] DEGENERATE: every run stands still in the clip "
+              f"(root error > {prepare.WALKING_ROOT_ERR_MAX} m) while "
+              f"completing it. That is the failure tracking_score exists to "
+              f"expose, not a policy to rank.")
+
     mean = statistics.fmean(scores)
     spread = (max(scores) - min(scores)) if len(scores) > 1 else 0.0
     base = baseline_from_results()
 
     if args.baseline or base is None:
-        verdict = "BASELINE"
-        print(f"\n[experiment] BASELINE tracking_score {mean:.5f}  spread {spread:.5f}")
+        # A baseline that is bimodal, or that is standing still, would make
+        # every future candidate pair against it. `baseline_from_results`
+        # matches the verdict string EXACTLY, so the suffix is what keeps a
+        # faulty baseline from ever being picked up as one.
+        fault = mode_fault(modes)
+        call = f"BASELINE-{fault}" if fault else "BASELINE"
+        print(f"\n[experiment] {call} tracking_score {mean:.5f}  spread {spread:.5f}")
         print(f"[experiment] per-seed {', '.join(f'{x:.5f}' for x in scores)}")
+        if fault:
+            print(f"[experiment] NOT recorded as a usable baseline ({fault}) - "
+                  f"nothing can be paired against this. Fix the arm and re-run "
+                  f"before measuring any candidate against it.")
     elif len(base) != len(scores):
         print(f"\n[experiment] baseline has {len(base)} runs, this has "
               f"{len(scores)} - cannot pair. Re-run the baseline at "
@@ -222,44 +351,38 @@ def main():
         return 1
     else:
         d = [c - b for c, b in zip(scores, base)]
-        mean_d = statistics.fmean(d)
-        paired_spread = (max(d) - min(d)) if len(d) > 1 else 0.0
         floor = prepare.PAIRED_NOISE_FLOOR
-        bar = max(paired_spread, floor or 0.0)
+        call, st = verdict(d, floor, modes)
 
         print()
         for k, (b, c, dk) in enumerate(zip(base, scores, d)):
             seed = prepare.TRAIN_SEEDS[k % len(prepare.TRAIN_SEEDS)]
-            print(f"[experiment] seed {seed}: {b:.5f} -> {c:.5f}   {dk:+.5f}")
-        print(f"[experiment] mean paired delta {mean_d:+.5f}   bar {bar:.5f}"
-              f"   (paired spread {paired_spread:.5f}, floor "
-              f"{'unmeasured' if floor is None else f'{floor:.5f}'})")
-
-        agree = all(x > 0 for x in d) or all(x < 0 for x in d)
-        if not agree:
-            verdict = "NEUTRAL"
-            print("[experiment] seeds disagree on the SIGN - not an effect.")
-        # HIGHER IS BETTER. tracking_score is the reward's own tracking
-        # PRODUCT, bounded (0, 1], so a POSITIVE delta is the improvement. This
-        # direction has now flipped twice - completion_rate up, tracking_error
-        # down, tracking_score up - and getting it backwards ranks every result
-        # upside down while still printing confident verdicts.
-        elif mean_d > bar:
-            verdict = "KEEP"
-        elif mean_d < -bar:
-            verdict = "DISCARD"
+            print(f"[experiment] seed {seed}: {b:.5f} -> {c:.5f}   "
+                  f"{dk:+.5f}   {modes[k]}")
+        # HIGHER IS BETTER. tracking_score is the reward's own tracking PRODUCT,
+        # bounded (0, 1], so a POSITIVE delta is the improvement. This direction
+        # has now flipped twice - completion_rate up, tracking_error down,
+        # tracking_score up - and getting it backwards ranks every result upside
+        # down while still printing confident verdicts.
+        if st["se"]:
+            print(f"[experiment] mean paired delta {st['mean']:+.5f}   "
+                  f"sd {st['sd']:.5f}   se {st['se']:.5f}   "
+                  f"t {st['t']:+.3f} vs crit {st['crit']:.3f} (df {st['df']})")
         else:
-            verdict = "NEUTRAL"
+            print(f"[experiment] mean paired delta {st['mean']:+.5f}   "
+                  f"(n={st['n']} - nothing to estimate a spread from)")
+        print("[experiment] floor "
+              + ("unmeasured" if floor is None else f"{floor:.5f}"))
 
-        if floor is None and verdict in ("KEEP", "DISCARD"):
-            print(f"[experiment] would call {verdict}, but PAIRED_NOISE_FLOOR "
-                  f"is unmeasured, so the bar has no floor and this may be "
-                  f"luck. Run the baseline AGAIN as a candidate (a null "
-                  f"experiment) and set prepare.PAIRED_NOISE_FLOOR from it.")
-            verdict = "UNCALIBRATED"
+        if call == "UNCALIBRATED":
+            print("[experiment] the effect RESOLVES, but PAIRED_NOISE_FLOOR is "
+                  "unmeasured, so there is no size gate and this may be real "
+                  "and negligible. Run the baseline AGAIN as a candidate (a "
+                  "null experiment) at these repeats, then set "
+                  "prepare.PAIRED_NOISE_FLOOR from its |mean paired delta|.")
 
-        print(f"[experiment] VERDICT: {verdict}")
-        if verdict == "NEUTRAL":
+        print(f"[experiment] VERDICT: {call}")
+        if call == "NEUTRAL":
             print("[experiment] inside the noise - this is not a result. "
                   "Record it and move on rather than re-running until it wins.")
 
@@ -271,11 +394,12 @@ def main():
     with RESULTS.open("a") as f:
         f.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\t"
                 f"{args.note}\t{mean:.5f}\t{spread:.5f}\t{args.repeats}\t"
-                f"{base_mean}\t{verdict}\t{diff_lines()}\t"
+                f"{base_mean}\t{call}\t{diff_lines()}\t"
                 f"{','.join(f'{x:.5f}' for x in scores)}\t"
                 f"{avg('tracking_error'):.5f}\t{avg('root_error_m'):.5f}\t"
                 f"{avg('ee_error_m'):.5f}\t"
-                f"{avg('completion_rate'):.4f}\n")
+                f"{avg('completion_rate'):.4f}\t"
+                f"{','.join(modes)}\n")
     print(f"[experiment] recorded in {RESULTS.name}")
     return 0
 

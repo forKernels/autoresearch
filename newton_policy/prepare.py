@@ -57,9 +57,20 @@ EVAL_SEED = 20260826
 
 #: Kamino and MuJoCo are not bit-deterministic - the WS-1 handoff measured 3%
 #: between two identical DR Legs runs and 11% across three. A single comparison
-#: is noise, so a candidate is run twice and only accepted if it beats the
-#: baseline by more than the observed spread.
-EVAL_REPEATS = 2
+#: is noise, so a candidate is run several times and compared PAIRWISE against
+#: a baseline that faced the same initialisations.
+#:
+#: Was 2, which is not enough to do statistics with and was the reason k_ee
+#: could not be resolved. At n=2 the only available tests are "do both seeds
+#: agree on the sign" and "is the mean bigger than the worse of two draws" -
+#: the first is a coin flip on one outlier and the second has no confidence
+#: attached. Measured, on an identical re-run of an identical config: seed
+#: 20260826 moved +0.00551 and seed 19720305 moved -0.03589. One draw set a
+#: bar twenty times the effect being looked for.
+#:
+#: 6 buys a real paired t-test at df=5. The cost is linear and it is the whole
+#: cost of this change: ~19 min per run, so an arm goes from ~38 min to ~2 h.
+EVAL_REPEATS = 6
 
 #: One training seed per repeat, applied at IMPORT time (see `_seed_training`).
 #:
@@ -68,7 +79,15 @@ EVAL_REPEATS = 2
 #: on whichever seed flatters it and report that. Fixing them here makes every
 #: arm face the same two initialisations, which is what turns a comparison of
 #: two noisy means into a PAIRED comparison where the initialisation cancels.
-TRAIN_SEEDS = (20260826, 19720305)
+#: There must be at least EVAL_REPEATS of them and they must be DISTINCT.
+#: `_seed_training` indexes TRAIN_SEEDS[run % len], so a list shorter than the
+#: repeat count silently cycles: six runs on two seeds are three repeated
+#: measures of two initialisations, not six independent paired differences,
+#: and a t-test over them would count the same initialisation three times.
+#: The last four were drawn once and frozen; nothing depends on their values,
+#: only on their being fixed here rather than chosen per-arm.
+TRAIN_SEEDS = (20260826, 19720305, 20250413, 19680721,
+               20111102, 19940318)
 
 #: The paired noise floor: how far apart two runs of the SAME config on the
 #: SAME seed land, measured by re-running the baseline against itself.
@@ -92,21 +111,23 @@ TRAIN_SEEDS = (20260826, 19720305)
 #: `tracking_error` ran 0.02-0.07, so carrying the old number would set a bar
 #: a fifth of the entire range wide. A noise floor belongs to the metric it was
 #: measured on, exactly as a baseline belongs to the task it was measured on.
-#: Measured by the null experiment on `tracking_score` WITH the end-effector
-#: factor, at TRAIN_ITERATIONS=1000. Paired differences +0.00551, -0.03589.
+#: UNMEASURED, deliberately, as of the move to a paired t-test at n=6.
 #:
-#: Read those two numbers before trusting this bar. Seed 20260826 reproduced to
-#: +0.00551; seed 19720305 moved -0.03589 on an identical re-run of an
-#: identical config. Same seed, same code, 6.5x the spread - the physics
-#: nondeterminism `_seed_training` warns about, and NOT mode-mixing: every run
-#: in the null sat at root_err_m ~0.08, all of them walking.
+#: It was 0.03589: `max |paired difference|` over an n=2 null, with paired
+#: differences +0.00551 and -0.03589. That statistic does not survive the
+#: change. The max of two samples has no confidence attached and inherits the
+#: worse draw wholesale; the new bar is a t-test at df=5, and a floor belongs
+#: to the statistic it was measured on exactly as it belongs to the metric it
+#: was measured on. Carrying 0.03589 forward would set a bar twenty times the
+#: k_ee effect size and call everything NEUTRAL with confidence - which is the
+#: failure this constant already had once, when the 0.1329 completion_rate
+#: floor was nearly carried onto tracking_error.
 #:
-#: This is `max |paired difference|` over n=2, which is the weakest part of the
-#: harness. The max of two samples has no confidence attached and inherits the
-#: worse draw wholesale, so one outlier set a bar ~20x the k_ee effect size. A
-#: real paired test needs EVAL_REPEATS well above 2; until then this number is
-#: a placeholder that errs toward NEUTRAL, which is the safe direction to err.
-PAIRED_NOISE_FLOOR = 0.03589
+#: `experiment.py` refuses to return KEEP or DISCARD while this is None, and
+#: reports UNCALIBRATED instead. Re-measure it by running the baseline AGAIN
+#: as a candidate (a null experiment) at EVAL_REPEATS=6 and setting this to
+#: the |mean paired delta| that null produces.
+PAIRED_NOISE_FLOOR = None
 
 
 def _seed_training():
@@ -344,17 +365,20 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
 
     ended = fell + finished
     completion = (finished / ended) if ended else 0.0
+    root_error_m = (root_sum / live_steps) if live_steps else float("inf")
     return {
         # THE metric. Bounded (0, 1], HIGHER is better.
         "tracking_score": (score_sum / live_steps) if live_steps else 0.0,
         # Kept as a diagnostic, not the goal - it is what ranked a stationary
         # robot above a walking one.
         "tracking_error": (joint_sum / live_steps) if live_steps else float("inf"),
-        "root_error_m": (root_sum / live_steps) if live_steps else float("inf"),
+        "root_error_m": root_error_m,
         "ee_error_m": (ee_sum / live_steps) if (has_ee and live_steps) else None,
         # The guard, not the goal.
         "completion_rate": completion,
         "comparable": completion >= COMPARABLE_COMPLETION,
+        # WHICH policy this is, not how good it is - see `classify_mode`.
+        "mode": classify_mode(root_error_m),
         "completed": finished,
         "terminated": fell,
         "episodes": ended,
@@ -369,6 +393,46 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
 #: one measured while it completes, so below this the result is flagged rather
 #: than silently ranked against results from the other regime.
 COMPARABLE_COMPLETION = 0.99
+
+
+#: Above this root error the policy is not tracking the clip, it is standing in
+#: it. `completion_rate` cannot see the difference and neither could anything
+#: else here until `tracking_score` arrived: a robot holding still in walking
+#: poses COMPLETES every episode, because completing means not falling over.
+#:
+#: Measured, and the two clusters are three quarters of a metre apart:
+#:
+#:     walking   0.07461  0.07518  0.07910  0.08003  0.08027  0.08074  0.08794
+#:     standing  0.89071 (the tracking_score baseline)
+#:               0.94104 (the 8000-iteration "success" from the WS-1 post-mortem)
+#:
+#: 0.20 sits above 2x the worst walking run and below half the best standing
+#: one. Nothing depends on the exact value inside that gap; it is a classifier
+#: for two well-separated clusters, not a threshold anyone should tune.
+WALKING_ROOT_ERR_MAX = 0.20
+
+
+def classify_mode(root_error_m):
+    """Which of the two policies this run found - NOT how good it is.
+
+    This exists because run-to-run variance here is not one distribution. It is
+    a MIXTURE: k_root_vel=20 scored 0.33009 and 0.87239 on its two seeds, and
+    k_root_vel=30 scored 0.29841 and 0.85096. Both were recorded NEUTRAL, which
+    reads as "no effect" when what actually happened is "sometimes collapses to
+    standing still". Averaging across the modes and calling the spread noise
+    inflates the bar with the mode-switch rate and hides a real failure as an
+    uninteresting one.
+
+    So a mixed-mode arm gets no verdict at all - see `experiment.verdict`. The
+    floor does not apply across modes, because the two arms were not measuring
+    the same thing.
+
+    Note what this is NOT for: the baseline/null/k_ee arms all sat at
+    root_err_m ~0.08, every run walking. Their spread is genuine within-mode
+    physics nondeterminism, and this guard would not have touched it. That is a
+    problem for EVAL_REPEATS, not for this function.
+    """
+    return "walking" if root_error_m <= WALKING_ROOT_ERR_MAX else "standing"
 
 
 def evaluate_completion(checkpoint, train_cfg, lookahead_seconds):

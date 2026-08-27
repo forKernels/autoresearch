@@ -135,6 +135,10 @@ def main():
     print(f"root_error_m:     {result['root_error_m']:.5f}")
     print(f"ee_error_m:       {result['ee_error_m'] if result['ee_error_m'] is None else round(result['ee_error_m'], 5)}")
     print(f"comparable:       {result['comparable']}")
+    # WHICH policy this run found. `experiment.py` parses this line: an arm
+    # whose seeds report different modes gets no verdict, because its spread is
+    # a mode-switch rate and not an error bar.
+    print(f"mode:             {result['mode']}")
     print(f"lookahead:        {result['lookahead_seconds']}")
     print(f"completion_rate:  {result['completion_rate']:.4f}")
     print(f"completed:        {result['completed']}")
