@@ -86,11 +86,15 @@ TRAIN_SEEDS = (20260826, 19720305)
 #: metric it was measured on, exactly as a baseline belongs to the task it was
 #: measured on.
 #:
-#: Measured by the null experiment on THIS metric (tracking_error at
-#: TRAIN_ITERATIONS=1000): the baseline re-run against itself, same seeds,
-#: nothing changed. Paired differences were -0.00674, -0.00950.
-#: A paired delta smaller than this is something the identical config makes.
-PAIRED_NOISE_FLOOR = 0.00950
+#: Unmeasured for `tracking_score`. It was 0.00950 on `tracking_error` and
+#: 0.1329 on `completion_rate` before that - three metrics, three floors, and
+#: none of them transferable. `tracking_score` is bounded (0, 1] where
+#: `tracking_error` ran 0.02-0.07, so carrying the old number would set a bar
+#: a fifth of the entire range wide. A noise floor belongs to the metric it was
+#: measured on, exactly as a baseline belongs to the task it was measured on.
+#: Measured by the null experiment on `tracking_score` at
+#: TRAIN_ITERATIONS=1000. Paired differences -0.01142, +0.01649.
+PAIRED_NOISE_FLOOR = 0.01649
 
 
 def _seed_training():
@@ -157,9 +161,31 @@ def _rl():
 def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     """THE METRIC. Roll a checkpoint out and measure how well it TRACKS.
 
-    Returns `tracking_error`, the mean absolute joint deviation from the
-    reference in radians, over every step where the policy was live. LOWER IS
-    BETTER - the opposite direction from the metric this replaces.
+    Returns `tracking_score`, the mean of the reward's own tracking product -
+    joint x velocity x root x orientation - over every step where the policy
+    was live. HIGHER IS BETTER, and it is bounded in (0, 1].
+
+    It replaces `tracking_error`, mean joint-angle deviation, which was blind
+    to the one thing the task is about. Measured: `k_root_vel=10` cut root
+    error by 91% (0.879 -> 0.082 m), turned a policy that STEPPED IN PLACE into
+    one that walks, and was called DISCARD - because a robot holding still with
+    its legs in walking poses tracks joint ANGLES better than one actually
+    walking, which contact perturbs. The metric ranked the stationary robot
+    above the moving one.
+
+    The product is the right shape because the reward already reconciles
+    radians against metres through `k_joint` and `k_root`; the old metric took
+    only the joint half of a quantity the reward had already balanced.
+
+    The weights are PINNED HERE and the scorer is built here, never taken from
+    the environment under evaluation. The candidate controls that environment's
+    reward - `train.py`'s ENV_KWARGS reaches it - and a metric a candidate can
+    tune is not a metric. The scorer also carries no `k_ee`, no alive bonus and
+    no penalties: those are knobs, and a knob inside the scoring function
+    rewards itself.
+
+    `k_root_vel` is deliberately NOT scored, for the same reason. It is a
+    candidate's term; what it BUYS shows up in the root factor, which is scored.
 
     Why it replaces `completion_rate`, which is still reported below as a
     guard: completion saturates. Past ~750 iterations every policy finishes
@@ -237,8 +263,14 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     torch.manual_seed(EVAL_SEED)
     obs, _ = vec.reset()
     fell = finished = 0
-    joint_sum = root_sum = ee_sum = 0.0
+    joint_sum = root_sum = ee_sum = score_sum = 0.0
     live_steps = 0
+
+    # The scorer, with weights pinned above and built HERE. k_root is in METRES
+    # and has to scale to the robot: carrying a 0.265 m robot's value onto a
+    # 0.76 m one collapses the product for an ordinary lag.
+    scorer = m["reward"].TrackingReward(
+        k_root=m["reward"].k_root_for_height(env.standing_height))
     has_ee = bool(getattr(env.reference, "has_body_positions", False))
 
     for _ in range(EVAL_STEPS):
@@ -264,6 +296,13 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
                 root_sum += float(
                     (root[:, :3] - root_ref[:, :3]).norm(dim=-1).sum())
 
+                # `tm`, not `t` - `t` is the time-outs mask a few lines up.
+                tm = scorer.terms(q, q_ref, env.actuated_dq()[live],
+                                  env._ref(env.reference.dq)[live],
+                                  root, root_ref)
+                score_sum += float((tm["joint"] * tm["vel"]
+                                    * tm["root"] * tm["ori"]).sum())
+
                 if has_ee:
                     ee = env.end_effector_positions()
                     if ee is not None:
@@ -275,7 +314,10 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     ended = fell + finished
     completion = (finished / ended) if ended else 0.0
     return {
-        # THE metric. Radians, lower is better.
+        # THE metric. Bounded (0, 1], HIGHER is better.
+        "tracking_score": (score_sum / live_steps) if live_steps else 0.0,
+        # Kept as a diagnostic, not the goal - it is what ranked a stationary
+        # robot above a walking one.
         "tracking_error": (joint_sum / live_steps) if live_steps else float("inf"),
         "root_error_m": (root_sum / live_steps) if live_steps else float("inf"),
         "ee_error_m": (ee_sum / live_steps) if (has_ee and live_steps) else None,

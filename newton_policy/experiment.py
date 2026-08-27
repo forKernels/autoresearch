@@ -35,9 +35,9 @@ sys.path.insert(0, str(HERE))
 import prepare  # noqa: E402  - read-only, owns the metric
 
 RESULTS = HERE / "results.tsv"
-HEADER = ("when\tnote\ttracking_mean\ttracking_spread\truns\t"
-          "baseline\tverdict\tdiff_lines\tscores\troot_err_m\tee_err_m\t"
-          "completion\n")
+HEADER = ("when\tnote\tscore_mean\tscore_spread\truns\t"
+          "baseline\tverdict\tdiff_lines\tscores\ttrack_err\troot_err_m\t"
+          "ee_err_m\tcompletion\n")
 
 #: Results measured before the paired design existed are in
 #: `results-unpaired.tsv`. They are kept rather than deleted, and they are NOT
@@ -59,7 +59,7 @@ HEADER = ("when\tnote\ttracking_mean\ttracking_spread\truns\t"
 _ALWAYS = re.compile(
     r"Traceback|\bError\b|\bassert|out of memory|\bKilled\b|"
     r"\bNaN\b|\bnan\b|"
-    r"^tracking_error:|^root_error_m:|^ee_error_m:|^comparable:|"
+    r"^tracking_score:|^tracking_error:|^root_error_m:|^ee_error_m:|^comparable:|"
     r"^completion_rate:|^completed:|^terminated:|^episodes:|^training_seconds:",
 )
 #: Progress. Throttled, because 300 iterations x several lines is 1500 lines
@@ -98,11 +98,11 @@ def run_once(index):
         line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip()
         tail.append(line)
 
-        m = re.match(r"tracking_error:\s*([\d.]+)", line.strip())
+        m = re.match(r"tracking_score:\s*([\d.]+)", line.strip())
         if m:
             score = float(m.group(1))
-        m = re.match(r"(root_error_m|ee_error_m|completion_rate):\s*([\d.]+)",
-                     line.strip())
+        m = re.match(r"(tracking_error|root_error_m|ee_error_m|completion_rate)"
+                     r":\s*([\d.]+)", line.strip())
         if m:
             extra[m.group(1)] = float(m.group(2))
         if line.strip().startswith("comparable:"):
@@ -126,7 +126,7 @@ def run_once(index):
             print(f"    {line}")
         return None
     if score is None:
-        print("  run produced no tracking_error - did train.py print the summary?")
+        print("  run produced no tracking_score - did train.py print the summary?")
         for line in tail:
             print(f"    {line}")
         return None
@@ -192,7 +192,7 @@ def main():
         s, extra = got
         scores.append(s)
         extras.append(extra)
-        print(f"  tracking_error {s:.5f}   root {extra.get('root_error_m', float('nan')):.5f}"
+        print(f"  tracking_score {s:.5f}   root {extra.get('root_error_m', float('nan')):.5f}"
               f"   ee {extra.get('ee_error_m', float('nan')):.5f}"
               f"   completion {extra.get('completion_rate', float('nan')):.4f}")
 
@@ -213,7 +213,7 @@ def main():
 
     if args.baseline or base is None:
         verdict = "BASELINE"
-        print(f"\n[experiment] BASELINE tracking_error {mean:.5f}  spread {spread:.5f}")
+        print(f"\n[experiment] BASELINE tracking_score {mean:.5f}  spread {spread:.5f}")
         print(f"[experiment] per-seed {', '.join(f'{x:.5f}' for x in scores)}")
     elif len(base) != len(scores):
         print(f"\n[experiment] baseline has {len(base)} runs, this has "
@@ -239,13 +239,14 @@ def main():
         if not agree:
             verdict = "NEUTRAL"
             print("[experiment] seeds disagree on the SIGN - not an effect.")
-        # LOWER IS BETTER. tracking_error is an ERROR, so a NEGATIVE delta is
-        # an improvement - the opposite of completion_rate, which this replaced.
-        # Getting this backwards would rank every result upside down while
-        # still printing confident verdicts.
-        elif mean_d < -bar:
-            verdict = "KEEP"
+        # HIGHER IS BETTER. tracking_score is the reward's own tracking
+        # PRODUCT, bounded (0, 1], so a POSITIVE delta is the improvement. This
+        # direction has now flipped twice - completion_rate up, tracking_error
+        # down, tracking_score up - and getting it backwards ranks every result
+        # upside down while still printing confident verdicts.
         elif mean_d > bar:
+            verdict = "KEEP"
+        elif mean_d < -bar:
             verdict = "DISCARD"
         else:
             verdict = "NEUTRAL"
@@ -272,7 +273,8 @@ def main():
                 f"{args.note}\t{mean:.5f}\t{spread:.5f}\t{args.repeats}\t"
                 f"{base_mean}\t{verdict}\t{diff_lines()}\t"
                 f"{','.join(f'{x:.5f}' for x in scores)}\t"
-                f"{avg('root_error_m'):.5f}\t{avg('ee_error_m'):.5f}\t"
+                f"{avg('tracking_error'):.5f}\t{avg('root_error_m'):.5f}\t"
+                f"{avg('ee_error_m'):.5f}\t"
                 f"{avg('completion_rate'):.4f}\n")
     print(f"[experiment] recorded in {RESULTS.name}")
     return 0

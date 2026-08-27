@@ -28,12 +28,48 @@ falls over.
 One experiment is **1000 iterations at 512 environments** — about twenty minutes,
 so roughly three per hour. Run it as `uv run newton_policy/train.py`.
 
-**The goal: the LOWEST `tracking_error`.**
+**The goal: the HIGHEST `tracking_score`.**
 
-Mean absolute joint deviation from the reference, in radians, over every step
-where the policy was live. **Lower is better** — the opposite direction from the
-metric this replaces, so a candidate that improves is one whose delta is
-NEGATIVE.
+The mean of the reward's own tracking product — joint x velocity x root x
+orientation — over every step where the policy was live. Bounded (0, 1].
+**Higher is better.**
+
+Note the direction has now flipped twice: `completion_rate` up, `tracking_error`
+down, `tracking_score` up. Check it before reading a verdict.
+
+### Why not `tracking_error`
+
+Because mean joint-angle deviation is blind to locomotion, which is the whole
+task. Measured: `k_root_vel=10` cut root error 91% (0.879 -> 0.082 m), turned a
+policy that STEPPED IN PLACE into one that walks - and was called DISCARD,
+because a robot holding still with its legs in walking poses tracks joint
+ANGLES better than one actually walking, which contact perturbs.
+
+The two metrics rank the same pair of policies OPPOSITE ways:
+
+```
+                                  tracking_score  tracking_error  root_err_m
+k_root_vel=10 (walks)                     0.8866         0.07540     0.08181
+8000 iterations, no k_root_vel            0.3241         0.02234     0.94104
+```
+
+The second is the policy an earlier post-mortem recorded as a success - zero
+falls in 1175 episodes, completes from any start phase. It has 0.94 m of root
+error. It was standing still, and nothing being measured at the time could say
+so.
+
+The product is the right shape because the reward already reconciles radians
+against metres through `k_joint` and `k_root`. The old metric took only the
+joint half of a quantity the reward had already balanced.
+
+### The scorer's weights are pinned, and that is the safety property
+
+They live in `prepare.py` and the scorer is built there, never taken from the
+environment under evaluation - `train.py`'s ENV_KWARGS reaches that
+environment's reward, and a metric a candidate can tune is not a metric. The
+scorer carries no `k_ee`, no alive bonus and no penalties, because a knob inside
+the scoring function rewards itself. `k_root_vel` is not scored either; what it
+BUYS shows up in the root factor, which is.
 
 ### Why the budget is 1000 and not 300
 

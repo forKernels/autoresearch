@@ -47,6 +47,14 @@ ENV_KWARGS = dict(
     # very change it is the control for. reward.py gates on `if self.k_ee`, so
     # 0.0 skips the term entirely rather than multiplying by exp(0)=1.
     k_ee=0.0,
+    # THE CANDIDATE. Measured cause: the position term alone produced a policy
+    # that tracks joints to 0.048 rad, never falls, and STEPS IN PLACE - root
+    # error grew linearly at 0.488 m/s and forward speed was 0.161 against the
+    # reference's 0.996. `e_root` is an unbounded squared distance inside an
+    # exp and the reward is a PRODUCT, so at 2.7 m of drift the root factor is
+    # 2e-8 and the gradient of every other term goes with it. Velocity error
+    # does not accumulate, so it still pays where position has gone silent.
+    k_root_vel=10.0,
 )
 
 LOOKAHEAD_SECONDS = (0.0, 0.02, 0.04, 0.08)
@@ -122,6 +130,7 @@ def main():
     # run's checkpoints, joint and end-effector error improve with training
     # while ROOT error gets steadily worse (0.767 -> 0.941 m from iteration 750
     # to 7999). A single number would hide that trade rather than show it.
+    print(f"tracking_score:   {result['tracking_score']:.5f}")
     print(f"tracking_error:   {result['tracking_error']:.5f}")
     print(f"root_error_m:     {result['root_error_m']:.5f}")
     print(f"ee_error_m:       {result['ee_error_m'] if result['ee_error_m'] is None else round(result['ee_error_m'], 5)}")
