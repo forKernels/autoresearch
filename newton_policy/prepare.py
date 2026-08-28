@@ -161,7 +161,18 @@ METRICS = {
 #: reports UNCALIBRATED. Re-measure by running the baseline AGAIN as a
 #: candidate - a null experiment - and setting each entry from the |mean paired
 #: delta| that null produces FOR THAT METRIC.
+#: Measured 2026-08-27 by the null experiment at EVAL_REPEATS=6, as
+#: |mean paired delta| PER METRIC. A metric absent here is still
+#: None and still refuses KEEP/DISCARD.
 PAIRED_NOISE_FLOORS = {name: None for name in METRICS}
+PAIRED_NOISE_FLOORS.update(
+    ee_error_m=0.00340,
+    ori_error_rad=0.00261,
+    root_error_m=0.00260,
+    tracking_error=0.00749,
+    tracking_score=0.01255,
+    vel_error=0.00238,
+)
 
 
 def _seed_training():

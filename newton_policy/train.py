@@ -42,11 +42,16 @@ ENV_KWARGS = dict(
     alive_bonus=0.0,
     action_penalty=0.0,
     # action_scale=0.5,             # the robot's own default if omitted
-    # Explicitly off. The reference HAS body positions, so leaving this unset
-    # would auto-scale the end-effector term on and make the baseline carry the
-    # very change it is the control for. reward.py gates on `if self.k_ee`, so
-    # 0.0 skips the term entirely rather than multiplying by exp(0)=1.
-    k_ee=0.0,
+    # THE CANDIDATE. 4.863 is `reward.k_ee_for_height(0.76)`, the same
+    # auto-scaled value the SCORER uses, so training and evaluation weight the
+    # term identically.
+    #
+    # It is 0.0 for a baseline or null arm, and that is not merely "off": the
+    # reference HAS body positions, so leaving it unset would auto-scale the
+    # end-effector term on and make the control carry the very change it is
+    # the control for. reward.py gates on `if self.k_ee`, so 0.0 skips the
+    # term entirely rather than multiplying by exp(0)=1.
+    k_ee=4.863,
     # THE CANDIDATE. Measured cause: the position term alone produced a policy
     # that tracks joints to 0.048 rad, never falls, and STEPS IN PLACE - root
     # error grew linearly at 0.488 m/s and forward speed was 0.161 against the
