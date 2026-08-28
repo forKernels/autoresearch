@@ -51,7 +51,7 @@ ENV_KWARGS = dict(
     # end-effector term on and make the control carry the very change it is
     # the control for. reward.py gates on `if self.k_ee`, so 0.0 skips the
     # term entirely rather than multiplying by exp(0)=1.
-    k_ee=4.863,
+    k_ee=0.0,
     # THE CANDIDATE. Measured cause: the position term alone produced a policy
     # that tracks joints to 0.048 rad, never falls, and STEPS IN PLACE - root
     # error grew linearly at 0.488 m/s and forward speed was 0.161 against the
