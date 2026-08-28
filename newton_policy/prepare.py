@@ -26,7 +26,13 @@ from pathlib import Path
 # --- fixed, not the agent's to change ---------------------------------------
 
 NEWTON = "/home/lupin4/_git/newton-8ce54fac"      # the WS-1 pinned commit
-NEWTON_LAB = "/home/lupin4/_git/newton-lab"
+#: The TRAINER, which as of 2026-08-28 is its own repo rather than a branch of
+#: the Blender add-on. Switching this changes which code trains, so it was
+#: verified rather than assumed: the only files that differ are reference.py,
+#: motion.py and motion_check.py - the v2 clip format - and loading the shipped
+#: v1 clip through both versions is BIT-IDENTICAL across _q, _dq, _root, _body,
+#: the labels, the fps and the duration. So the ledger is not re-based by this.
+NEWTON_LAB = "/home/lupin4/_git/newton-lab-train"
 #: Carries four root-relative end-effector tracks (ankles + elbows) as well
 #: as joints, so the k_ee reward term has something to score. Changing this
 #: changes the TASK - the baseline below was re-measured against it.
