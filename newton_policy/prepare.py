@@ -367,7 +367,7 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
     # 0.76 m one collapses the product for an ordinary lag.
     scorer = m["reward"].TrackingReward(
         k_root=m["reward"].k_root_for_height(env.standing_height),
-        k_ee=m["reward"].k_ee_for_height(env.standing_height))
+        k_ee=SCORER_K_EE)
     has_ee = bool(getattr(env.reference, "has_body_positions", False))
 
     for _ in range(EVAL_STEPS):
@@ -452,6 +452,24 @@ def evaluate_tracking(checkpoint, train_cfg, lookahead_seconds):
 #: one measured while it completes, so below this the result is flagged rather
 #: than silently ranked against results from the other regime.
 COMPARABLE_COMPLETION = 0.99
+
+
+#: The SCORER's end-effector weight, pinned here and NOT read from
+#: `reward.k_ee_for_height`.
+#:
+#: It used to call that function, which meant the metric moved whenever the
+#: TRAINING default moved. Latent for as long as the two happened to want the
+#: same number; live the moment the k_ee sweep found 1.2 and
+#: `REFERENCE_K_EE` was re-set to deliver it. Changing a training knob would
+#: have silently re-scaled the ruler and invalidated every row in results.tsv
+#: at the same time - the exact failure the read-only rule exists to prevent,
+#: arriving through a shared helper rather than through an edit here.
+#:
+#: 4.863 is `40.0 * (0.265/0.76)**2`, the value every recorded row was measured
+#: with. It is pinned as a NUMBER so that no change to the reward library can
+#: reach it. A scorer constant is not a knob to tune: if it ever moves, the
+#: baseline and all six floors are re-measured in the same commit.
+SCORER_K_EE = 4.863
 
 
 #: Above this root error the policy is not tracking the clip, it is standing in
